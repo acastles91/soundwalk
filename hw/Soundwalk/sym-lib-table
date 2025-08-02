@@ -1,0 +1,7 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "GPTS203211B_THT_Switch")(type "Legacy")(uri "/home/antonio/dev/kicad-modules/ESP32-Circuit/2022-03-25_16-40-37.lib")(options "")(descr ""))
+  (lib (name "105450-0101-USB-C-SNAPEDA")(type "Legacy")(uri "/home/antonio/dev/kicad-modules/ESP32-Circuit/105450-0101.lib")(options "")(descr ""))
+  (lib (name "menelaos-v2-rescue")(type "KiCad")(uri "/home/antonio/dev/menelaos/menelaos/menelaos-v2-rescue.kicad_sym")(options "")(descr ""))
+  (lib (name "fdcanusb")(type "KiCad")(uri "/home/antonio/dev/fdcanusb/hw/fdcanusb.kicad_sym")(options "")(descr ""))
+)

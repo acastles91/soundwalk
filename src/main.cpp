@@ -1,0 +1,1096 @@
+#include <Arduino.h>
+#include <Adafruit_DotStar.h>
+
+// Pin assignments
+#define HIN1 25
+#define LIN1 21
+#define HIN2 26
+#define LIN2 22
+#define HIN3 27
+#define LIN3 23
+#define ENABLE 4
+#define LED_BUILTIN 2
+#define AIN1 5
+#define AIN2 18
+#define PHASE3_ZC_PIN 32
+#define PHASE2_ZC_PIN 34
+#define PHASE1_ZC_PIN 35
+#define DATAPIN    13
+#define CLOCKPIN   14
+#define DUMBLED 19
+
+// LEDS
+
+#define NUM_LEDS 30  // Change to the number of LEDs in your strip
+//modes
+
+//#define TEST
+#define PWM
+//#define DIGITAL
+//#define ZC
+//#define LEDTEST
+
+// PWM parameters
+#define PWM_FREQ 20
+#define PWM_RESOLUTION 8
+#define PWM_DUTY 150 //  duty cycle to limit current
+#define PWM_MAX 255
+#define DELAY_PWM 50
+
+#define LED_STRIP_PIN 19
+#define LED_STRIP_CHANNEL 8  // Choose a channel from 0–15
+#define LED_STRIP_FREQ 1000  // 1kHz is good for visible LEDs
+#define LED_STRIP_RESOLUTION 8  // 8 bits: values from 0–255
+
+
+// Actuator parameters
+#define ACTUATOR_PWM_FREQ 40
+#define ACTUATOR_PWM_RESOLUTION 8
+#define ACTUATOR_PWM_DUTY 255
+#define ACTUATOR_PWM_MAX 128
+#define ACTUATOR_DELAY_PWM 50
+
+// Channels for HIN (PWM)
+#define HIN1_CH 0
+#define HIN2_CH 1
+#define HIN3_CH 2
+
+// Channels for LIN (PWM)
+#define LIN1_CH 3
+#define LIN2_CH 4
+#define LIN3_CH 5
+
+
+//Channels for AIN (PWM)
+#define AIN1_CH 6
+#define AIN2_CH 7
+
+Adafruit_DotStar strip(NUM_LEDS, DATAPIN, CLOCKPIN, DOTSTAR_BRG);
+
+
+// Acceleration variables
+hw_timer_t* timer = NULL;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+
+hw_timer_t* commutationDelayTimer = NULL;
+//portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+
+volatile int step = 0;
+volatile int commutationStep = 0;
+int baseDelay = 200;
+unsigned long startTime;
+volatile int currentStep = 0;
+volatile bool usingZeroCross = false;
+volatile bool commutationFlag = false;
+volatile int nextStep = 0;
+
+//ZC acceleration
+float rampSpeed = 0.0;
+float rampMaxSpeed = 300.0;  // or whatever value fits
+float rampStep = 1.5;        // controls acceleration
+const int floatingPhase[6] = {2, 1, 0, 2, 1, 0};  // Corresponds to C, B, A, C, B, A
+
+#ifdef PWM
+//"Working PWM" acceleration variables
+//int minDelay = 7;
+//int maxDelay = 55;  // start slow
+//int minDelay_us = minDelay * 1000;  //minDelay_us
+//int maxDelay_us = maxDelay * 1000;
+//float rampK = 0.65;   // slope control
+int minDelay = 12;
+int maxDelay = 55;  // start slow
+int minDelay_us = minDelay * 1000;  //minDelay_us
+int maxDelay_us = maxDelay * 1000;
+float rampK = 0.65;   // slope control
+#endif
+#ifdef DIGITAL
+// "Working Digital" acceleration variables
+//int minDelay = 5;
+//int maxDelay = 50;  // start slow
+//int minDelay_us = minDelay * 1000;  //minDelay_us
+//int maxDelay_us = maxDelay * 1000;
+//float rampK = 0.65;   // slope control
+
+#endif
+//acceleration timer
+
+unsigned long lastBlinkTime = 0;
+bool ledOn = false;
+const unsigned long blinkInterval = 18; // 100 ms = 10 blinks/sec
+
+
+int currentDelay_us = 3000;  // start slow
+
+// 6-step commutation table (digital fallback)
+const int8_t commutationTable[6][6] = {
+  {1, 0, 0, 1, 0, 0},
+  {1, 0, 0, 0, 0, 1},
+  {0, 0, 1, 0, 0, 1},
+  {0, 1, 1, 0, 0, 0},
+  {0, 1, 0, 0, 1, 0},
+  {0, 0, 0, 1, 1, 0}
+};
+
+// Digital-style commutation via PWM
+const int8_t commutationHIN[6][3] = {
+  {1, 0, 0},
+  {1, 0, 0},
+  {0, 1, 0},
+  {0, 1, 0},
+  {0, 0, 1},
+  {0, 0, 1}
+};
+
+const int8_t commutationLIN[6][3] = {
+  {0, 1, 0},
+  {0, 0, 1},
+  {0, 0, 1},
+  {1, 0, 0},
+  {1, 0, 0},
+  {0, 1, 0}
+};
+
+// Actuator variables
+
+int pwmValue = PWM_DUTY;           // Speed (0 - 255)
+int pwmStep = 20;           // Speed increment
+bool running = false;
+bool forward = true;
+bool actuatorBurstActive = false;
+unsigned long burstStartTime = 0;
+char burstChannel = 0; // 'A' or 'B'
+unsigned long burstDuration = 60;
+unsigned long burstValue = 125;
+bool bursting = false;
+
+void setHIN(uint8_t phase, bool on) {
+  uint8_t pin = (phase == 0) ? HIN1 : (phase == 1) ? HIN2 : HIN3;
+  digitalWrite(pin, on ? HIGH : LOW);
+}
+
+void setHIN_PWM(uint8_t phase, int8_t mode) {
+  if (phase > 2) return; // Safety check
+  uint8_t channel = (phase == 0) ? HIN1_CH : (phase == 1) ? HIN2_CH : HIN3_CH;
+  ledcWrite(channel, mode ? PWM_DUTY : 0);
+}
+
+void setLIN_PWM(uint8_t phase, int8_t mode) {
+  if (phase > 2) return; // Safety check
+  uint8_t channel = (phase == 0) ? LIN1_CH : (phase == 1) ? LIN2_CH : LIN3_CH;
+  ledcWrite(channel, mode ? PWM_DUTY : 0);
+}
+
+
+void setLIN(uint8_t phase, int8_t mode) {
+  uint8_t pin = (phase == 0) ? LIN1 : (phase == 1) ? LIN2 : LIN3;
+  digitalWrite(pin, mode ? HIGH : LOW);
+}
+
+// Classic 6-step PWM commutation
+void runPWM(int& baseDelayArg) {
+  for (int i = 0; i < 3; i++) {
+    setHIN(i, commutationHIN[step][i]);
+    setLIN(i, commutationLIN[step][i]);
+  }
+  if (baseDelayArg < 16000) {
+  delayMicroseconds(baseDelayArg);  // Use accurate microsecond delay
+} else {
+  delay(baseDelayArg / 1000);       // Convert to milliseconds
+}
+  step = (step + 1) % 6;
+
+  Serial.println("Step: " + String(step));
+}
+
+
+// Experimental sine output mode
+void runSine() {
+  static float angle = 0;
+  static float rpm = 5.0;
+  const float pi = 3.14159;
+  const float updateDelayMs = 2;
+
+  float freqHz = rpm / 60.0;
+  angle += 2.0 * pi * freqHz * updateDelayMs / 1000.0;
+  if (angle > 2.0 * pi) angle -= 2.0 * pi;
+
+  float sA = sin(angle);
+  float sB = sin(angle - 2.0 * pi / 3.0);
+  float sC = sin(angle + 2.0 * pi / 3.0);
+
+  int dutyA = (int)((sA + 1.0) * 0.5 * PWM_MAX);
+  int dutyB = (int)((sB + 1.0) * 0.5 * PWM_MAX);
+  int dutyC = (int)((sC + 1.0) * 0.5 * PWM_MAX);
+
+  ledcWrite(LIN1_CH, dutyA);
+  ledcWrite(LIN2_CH, dutyB);
+  ledcWrite(LIN3_CH, dutyC);
+
+  digitalWrite(HIN1, HIGH);
+  digitalWrite(HIN2, HIGH);
+  digitalWrite(HIN3, HIGH);
+
+  delay(updateDelayMs);
+}
+
+int getSmoothDelay_us() {
+  unsigned long t = millis() - startTime;
+  float delayF = minDelay_us + (maxDelay_us - minDelay_us) * exp(-rampK * t / 1000.0);
+  return (int)delayF;
+}
+
+int getSmoothDelay() {
+  unsigned long t = millis() - startTime;
+  float delayF = minDelay + (maxDelay - minDelay) * exp(-rampK * t / 1000.0);
+  //float delayF = minDelay_us + (maxDelay_us - minDelay_us) * exp(-rampK * t / 1000.0);
+  return (int)delayF;
+}
+
+void alignRotor(int alignStep = 0, int durationMs = 500) {
+  // Get the logic levels directly from the commutation tables
+  digitalWrite(HIN1, commutationHIN[alignStep][0] ? HIGH : LOW);
+  digitalWrite(HIN2, commutationHIN[alignStep][1] ? HIGH : LOW);
+  digitalWrite(HIN3, commutationHIN[alignStep][2] ? HIGH : LOW);
+
+  digitalWrite(LIN1, commutationLIN[alignStep][0] ? HIGH : LOW);
+  digitalWrite(LIN2, commutationLIN[alignStep][1] ? HIGH : LOW);
+  digitalWrite(LIN3, commutationLIN[alignStep][2] ? HIGH : LOW);
+
+  delay(durationMs);
+}
+
+void alignRotorCycle(int stepDelay = 300) {
+  for (int stepIndex = 0; stepIndex < 6; stepIndex++) {
+    
+    digitalWrite(LED_BUILTIN, HIGH);
+    
+    const int8_t* hin = commutationHIN[stepIndex];
+    const int8_t* lin = commutationLIN[stepIndex];
+
+    digitalWrite(HIN1, hin[0] ? HIGH : LOW);
+    digitalWrite(HIN2, hin[1] ? HIGH : LOW);
+    digitalWrite(HIN3, hin[2] ? HIGH : LOW);
+
+    digitalWrite(LIN1, lin[0] ? HIGH : LOW);
+    digitalWrite(LIN2, lin[1] ? HIGH : LOW);
+    digitalWrite(LIN3, lin[2] ? HIGH : LOW);
+
+    delay(stepDelay);
+
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(300);
+  }
+
+  // Optionally, turn off all phases at the end to let the rotor coast
+  digitalWrite(HIN1, LOW); digitalWrite(HIN2, LOW); digitalWrite(HIN3, LOW);
+  digitalWrite(LIN1, LOW); digitalWrite(LIN2, LOW); digitalWrite(LIN3, LOW);
+}
+
+void alignRotorHold(int holdTimeMs = 1000) {
+  // Apply a known static state to align the rotor (step 0)
+  digitalWrite(LED_BUILTIN, HIGH);
+  digitalWrite(HIN1, HIGH);  // Phase A high
+  digitalWrite(HIN2, LOW);
+  digitalWrite(HIN3, LOW);
+
+  digitalWrite(LIN1, HIGH);
+  digitalWrite(LIN2, LOW);  // Phase B low
+  digitalWrite(LIN3, LOW);
+
+  delay(holdTimeMs);  //  Give time for rotor to move and hold
+
+  // Optionally disable outputs after alignment
+  digitalWrite(HIN1, LOW);
+  digitalWrite(HIN2, LOW);
+  digitalWrite(HIN3, LOW);
+  digitalWrite(LIN1, LOW);
+  digitalWrite(LIN2, LOW);
+  digitalWrite(LIN3, LOW);
+
+  digitalWrite(LED_BUILTIN, LOW);
+}
+
+void startMotor() {
+  digitalWrite(LED_BUILTIN, HIGH);  // Indicate motor is starting
+
+  startTime = millis();  // Reset timing for ramp logic
+  currentDelay_us = maxDelay_us;
+
+  portENTER_CRITICAL(&timerMux);
+  timerAlarmWrite(timer, currentDelay_us, true);
+  portEXIT_CRITICAL(&timerMux);
+
+  timerAlarmEnable(timer);
+  digitalWrite(LED_BUILTIN, LOW);
+}
+void startMotorZC() {
+  digitalWrite(LED_BUILTIN, HIGH);  // Indicate motor is starting
+
+  startTime = millis();  // Reset timing for ramp logic
+  currentDelay_us = maxDelay_us;
+
+  portENTER_CRITICAL(&timerMux);
+  timerAlarmWrite(commutationDelayTimer, currentDelay_us, true);
+  portEXIT_CRITICAL(&timerMux);
+
+  timerAlarmEnable(commutationDelayTimer);
+  digitalWrite(LED_BUILTIN, LOW);
+}
+void startActuator() {
+  if (forward) {
+    ledcWrite(AIN1, pwmValue);
+    ledcWrite(AIN2, 0);
+  } else {
+    ledcWrite(AIN1, 0);
+    ledcWrite(AIN2, pwmValue);
+  }
+  running = true;
+  }
+
+void stopActuator() {
+  ledcWrite(AIN1, 0);
+  ledcWrite(AIN2, 0);
+  running = false;
+}
+
+void speedUp() {
+  pwmValue = min(255, pwmValue + pwmStep);
+  if (running) startActuator(); // Update PWM
+}
+
+void speedDown() {
+  pwmValue = max(0, pwmValue - pwmStep);
+  if (running) startActuator(); // Update PWM
+}
+
+void reverseDirection() {
+  forward = !forward;
+}
+void IRAM_ATTR onZeroCross() {
+  portENTER_CRITICAL_ISR(&timerMux);
+  // Start the short delay before switching commutation step
+  timerAlarmWrite(commutationDelayTimer, 1, false); // Delay in µs
+  timerAlarmEnable(commutationDelayTimer);           // One-shot enable
+  //if (usingZeroCross) {
+  //  nextStep = (currentStep + 1) % 6;
+  //  commutationFlag = true;
+  ////timerAlarmDisable(commutationDelayTimer);
+  //}
+  portEXIT_CRITICAL_ISR(&timerMux);
+  }
+
+void IRAM_ATTR commutationTimerCallback() {
+  portENTER_CRITICAL_ISR(&timerMux);
+  if (usingZeroCross) {
+    nextStep = (currentStep + 1) % 6;
+    commutationFlag = true;
+    timerAlarmDisable(commutationDelayTimer);
+  }
+  portEXIT_CRITICAL_ISR(&timerMux);
+}
+
+
+void IRAM_ATTR runPWM_ISR() {
+  if (usingZeroCross) return;  // Prevent ISR from running once ZC takes over
+
+  portENTER_CRITICAL_ISR(&timerMux);
+
+  for (int i = 0; i < 3; i++) {
+    #ifdef PWM
+    setHIN_PWM(i, commutationHIN[step][i]);
+    setLIN_PWM(i, commutationLIN[step][i]);
+    #elif defined(DIGITAL)
+    setHIN(i, commutationHIN[step][i]);
+    setLIN(i, commutationLIN[step][i]);
+    #endif
+  }
+
+  step = (step + 1) % 6;
+  //GPIO.out ^= (1 << LED_BUILTIN);  // Debug LED toggle
+
+  portEXIT_CRITICAL_ISR(&timerMux);
+}
+
+void applyCommutationStep(int step) {
+  detachInterrupt(digitalPinToInterrupt(PHASE1_ZC_PIN));
+  detachInterrupt(digitalPinToInterrupt(PHASE2_ZC_PIN));
+  detachInterrupt(digitalPinToInterrupt(PHASE3_ZC_PIN));
+
+  // Clear all outputs
+  for (int i = 0; i < 3; i++) {
+  #ifdef PWM
+    setHIN_PWM(i, commutationHIN[step][i]);
+    setLIN_PWM(i, commutationLIN[step][i]);
+  #elif defined (DIGITAL) //DIGITAL
+    setHIN(i, commutationHIN[step][i]);
+    setLIN(i, commutationLIN[step][i]);
+  #endif
+  }
+  
+  int floating = floatingPhase[step];  // use previous step
+  int zcPin = (floating == 0) ? PHASE1_ZC_PIN :
+              (floating == 1) ? PHASE2_ZC_PIN :
+                                PHASE3_ZC_PIN;
+  
+  Serial.print("Step ");
+  Serial.print(step);
+  Serial.print(" -> Floating phase: ");
+  Serial.print(floating);
+  Serial.print(" (GPIO ");
+  Serial.print(zcPin);
+  Serial.println(")");
+
+  attachInterrupt(digitalPinToInterrupt(zcPin), onZeroCross, RISING);
+
+}
+unsigned long forwardDuration;
+unsigned long reverseDuration;
+unsigned long coastDuration;
+unsigned long breakDuration;
+enum ActuatorState { FORWARD = 0, REVERSE = 1, COAST = 2, BRAKE = 3, IDLE = 4 };
+ActuatorState actuatorState = IDLE;
+unsigned long actuatorTimer = 0;
+unsigned long stateDuration = 0;
+const unsigned long minDuration = 200;
+const unsigned long maxDuration = 3500;
+const unsigned long maxDurationForward = 2000;
+
+ActuatorState randomStateExcluding(std::initializer_list<ActuatorState> options) {
+  int idx = random(0, options.size());
+  return *(options.begin() + idx);
+}
+
+void setRandomDuration(ActuatorState state) {
+  switch (state) {
+    case FORWARD:
+      forwardDuration = 300 + random(0, 200); // 800–1300 ms
+      break;
+    case REVERSE:
+      reverseDuration = 600 + random(0, 400); // 600–1000 ms
+      break;
+    case COAST:
+      coastDuration = 2500 + random(0, 2000); // 2500–4500 ms
+      break;
+    case BRAKE:
+      breakDuration = 2000 + random(0, 1500); // 2000–3500 ms
+      break;
+    default:
+      break;
+  }
+}
+
+uint32_t Wheel(byte WheelPos) {
+  WheelPos = 255 - WheelPos;
+  if (WheelPos < 85) {
+    return strip.Color(255 - WheelPos * 3, 0, WheelPos * 3);
+  } else if (WheelPos < 170) {
+    WheelPos -= 85;
+    return strip.Color(0, WheelPos * 3, 255 - WheelPos * 3);
+  } else {
+    WheelPos -= 170;
+    return strip.Color(WheelPos * 3, 255 - WheelPos * 3, 0);
+  }
+}
+
+void updateLEDsForActuatorState() {
+  uint32_t color;
+  switch (actuatorState) {
+    case FORWARD: color = strip.Color(0, 0, 255); break;    
+    case REVERSE: color = strip.Color(255, 0, 0); break;    
+    case BRAKE:   color = strip.Color(0, 255, 0); break;  
+    case COAST:   color = strip.Color(255, 255, 0); break;   
+    case IDLE:    color = strip.Color(0, 0, 0); break;   
+  }
+
+  for (int i = 0; i < NUM_LEDS; i++) {
+    strip.setPixelColor(i, color);
+  }
+  strip.show();
+}
+
+void updateLEDsForActuatorStateBlink(unsigned long now) {
+  if (actuatorState == FORWARD) {
+    if (now - lastBlinkTime >= blinkInterval) {
+      lastBlinkTime = now;
+      ledOn = !ledOn;
+      uint32_t color = ledOn ? strip.Color(0, 0, 255) : strip.Color(0, 0, 0);
+      for (int i = 0; i < NUM_LEDS; i++) {
+        strip.setPixelColor(i, color);
+      }
+      strip.show();
+    }
+  } else if (actuatorState == COAST || actuatorState == BRAKE || actuatorState == REVERSE) {
+    // Optional: Set a static color
+    for (int i = 0; i < NUM_LEDS; i++) {
+      strip.setPixelColor(i, strip.Color(0, 0, 0));  // Dim blue, or adjust
+    }
+    strip.show();
+  } else { // IDLE
+    for (int i = 0; i < NUM_LEDS; i++) {
+      strip.setPixelColor(i, 0); // Off
+    }
+    strip.show();
+  }
+}
+
+void setLedStripBrightness(uint8_t brightness) {
+  // brightness: 0 (off) to 255 (full brightness)
+  ledcWrite(LED_STRIP_CHANNEL, brightness);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  actuatorState = (random(0, 2) == 0) ? COAST : BRAKE;
+
+  pinMode(LED_BUILTIN, OUTPUT);  // Try GPIO 2
+  pinMode(HIN1, OUTPUT); pinMode(LIN1, OUTPUT);
+  pinMode(HIN2, OUTPUT); pinMode(LIN2, OUTPUT);
+  pinMode(HIN3, OUTPUT); pinMode(LIN3, OUTPUT);
+  pinMode(ENABLE, OUTPUT);
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(PHASE3_ZC_PIN, INPUT);
+  pinMode(PHASE2_ZC_PIN, INPUT);
+  pinMode(PHASE1_ZC_PIN, INPUT);
+  
+  digitalWrite(ENABLE, HIGH);
+  
+  
+  alignRotorHold(1000);  // Pre-position the rotor before startup
+  //alignRotorCycle(3000);
+  #ifdef ZC
+
+  commutationDelayTimer = timerBegin(1, 80, true); // 1 µs tick (80 MHz / 80 = 1 MHz)
+  timerAttachInterrupt(commutationDelayTimer, &commutationTimerCallback, true);
+  timerAlarmWrite(commutationDelayTimer, 1, false); // 50 µs delay
+  timerAlarmDisable(commutationDelayTimer);
+  attachInterrupt(digitalPinToInterrupt(PHASE3_ZC_PIN), onZeroCross, RISING);  // or FALLING, test both
+  usingZeroCross = false;
+  
+  #endif
+
+  #ifdef PWM
+  ledcSetup(HIN1_CH, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(HIN1, HIN1_CH);
+  ledcSetup(HIN2_CH, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(HIN2, HIN2_CH);
+  ledcSetup(HIN3_CH, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(HIN3, HIN3_CH);
+
+  ledcSetup(LIN1_CH, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(LIN1, LIN1_CH);
+  ledcSetup(LIN2_CH, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(LIN2, LIN2_CH);
+  ledcSetup(LIN3_CH, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(LIN3, LIN3_CH);
+
+  ledcSetup(LED_STRIP_CHANNEL, LED_STRIP_FREQ, LED_STRIP_RESOLUTION);
+  ledcAttachPin(LED_STRIP_PIN, LED_STRIP_CHANNEL);
+  #endif 
+  
+  //alignRotor(2);
+  //alignRotorCycle(500);
+  //delay(1000);
+
+  #ifdef PWM
+  // Setup timer
+  timer = timerBegin(0, 80, true);  // 80 prescaler => 1 µs per tick
+  timerAttachInterrupt(timer, &runPWM_ISR, true);
+
+  #endif
+  //actuator
+
+  //startMotor();
+  stopActuator();
+
+  //usingZeroCross = true;
+  //currentStep = 0;
+  //applyCommutationStep(currentStep);
+  strip.begin();
+  strip.show();  // Initialize all pixels to 'off'
+
+  #ifdef TEST
+  ledcSetup(AIN1_CH, ACTUATOR_PWM_FREQ, ACTUATOR_PWM_RESOLUTION);
+  ledcAttachPin(AIN1, AIN1_CH);
+
+  ledcSetup(AIN2_CH, ACTUATOR_PWM_FREQ, ACTUATOR_PWM_RESOLUTION);
+  ledcAttachPin(AIN2, AIN2_CH);
+  #endif 
+  }
+
+#ifndef TEST  
+void loop() {
+  
+ //int newDelay = getSmoothDelay_us();
+
+ static bool started = false;
+ static bool accelerated = false;
+ static bool actuatorInitialized = false;
+ static bool onlyZCtest = false;
+
+  if (!started) {  // example: wait 3 sec then start
+    startMotor();
+    //startMotorZC();
+    started = true;
+  }
+
+  // Keep adjusting delay while running
+  if (started && !usingZeroCross && !onlyZCtest) {
+    int newDelay_us = getSmoothDelay_us();
+    if (newDelay_us >= minDelay_us + 2500 && !accelerated) {
+      currentDelay_us = newDelay_us;
+      portENTER_CRITICAL(&timerMux);
+      timerAlarmDisable(timer);
+      timerAlarmWrite(timer, newDelay_us, true);
+      timerAlarmEnable(timer);
+      portEXIT_CRITICAL(&timerMux);
+      Serial.println("Current delay us: " + String(currentDelay_us));
+    }
+    else if (newDelay_us <= minDelay_us + 2500) {
+      accelerated = true;
+      //usingZeroCross = true;
+      //digitalWrite(LED_BUILTIN, HIGH);
+      Serial.println("Accelerated: " + String(accelerated));
+      //timerAlarmDisable(timer);
+      pwmValue = min(PWM_DUTY + 50, PWM_MAX);
+      currentStep = step;
+      applyCommutationStep(currentStep);
+    }
+  }
+  if (onlyZCtest && !usingZeroCross && started) {
+      accelerated = true;
+      usingZeroCross = true;
+      digitalWrite(LED_BUILTIN, HIGH);
+      Serial.println("Accelerated: " + String(accelerated));
+      timerAlarmDisable(timer);
+      pwmValue = min(PWM_DUTY + 50, PWM_MAX);
+      currentStep = step;
+      applyCommutationStep(currentStep);
+    }
+  if (commutationFlag  && accelerated ) {
+      Serial.println("Next step: " + String(nextStep));
+      currentStep = nextStep;
+      applyCommutationStep(nextStep);
+      commutationFlag = false;
+    }
+  
+//  if (commutationFlag) {
+//    Serial.println("Next step: " + String(nextStep));
+//    currentStep = nextStep;
+//    applyCommutationStep(currentStep);
+//    commutationFlag = false;
+//  }
+
+  if (accelerated && !actuatorInitialized) {
+   // Actuator PWM SETUP
+  ledcSetup(AIN1_CH, ACTUATOR_PWM_FREQ, ACTUATOR_PWM_RESOLUTION);
+  ledcAttachPin(AIN1, AIN1_CH);
+
+  ledcSetup(AIN2_CH, ACTUATOR_PWM_FREQ, ACTUATOR_PWM_RESOLUTION);
+  ledcAttachPin(AIN2, AIN2_CH);
+ 
+  actuatorInitialized = true;
+  //ledcWrite(AIN1_CH, 100);
+  //ledcWrite(AIN2_CH, 0);  // Or 255 for full power
+  }
+
+unsigned long now = millis();
+
+switch (actuatorState) {
+  case IDLE:
+    ledcWrite(AIN1_CH, 0);
+    ledcWrite(AIN2_CH, 0);
+    actuatorTimer = now;
+    actuatorState = FORWARD;
+    setRandomDuration(FORWARD);
+    break;
+
+  case FORWARD:
+    if (now - actuatorTimer < forwardDuration && bursting == false) {
+      ledcWrite(AIN2_CH, burstValue);
+      burstStartTime = millis();
+      bursting = true;
+      ledcWrite(AIN2_CH, burstValue);
+    }
+    if (millis() - burstStartTime > burstDuration && bursting == true) {
+        ledcWrite(AIN2_CH, 60);
+        ledcWrite(AIN1_CH, 70);    
+        bursting = false;
+        digitalWrite(LED_BUILTIN, HIGH);
+        now = millis();
+    } 
+    if (now - actuatorTimer > forwardDuration) {
+      actuatorTimer = now;
+      ActuatorState options[] = {COAST, BRAKE};
+      actuatorState = options[random(0, 2)];
+      digitalWrite(LED_BUILTIN, LOW);
+      setRandomDuration(actuatorState);
+    }
+    break;
+
+  case REVERSE:
+    if (now - actuatorTimer < reverseDuration && bursting == false) {
+      ledcWrite(AIN1_CH, burstValue);
+      burstStartTime = millis();
+      bursting = true;
+      ledcWrite(AIN1_CH, burstValue);
+    }
+    if (millis() - burstStartTime > burstDuration && bursting == true) {
+     ledcWrite(AIN1_CH, 60);
+     ledcWrite(AIN2_CH, 50);
+     bursting = false;
+     now = millis(); 
+    }
+    if (now - actuatorTimer > reverseDuration) {
+      actuatorTimer = now;
+      ActuatorState options[] = {FORWARD, COAST, BRAKE};
+      actuatorState = options[random(0, 3)];
+      setRandomDuration(actuatorState);
+    }
+    break;
+    
+  case COAST:
+    if (now - actuatorTimer < coastDuration) {
+      ledcWrite(AIN1_CH, 0);
+      ledcWrite(AIN2_CH, 0);
+    } else {
+      actuatorTimer = now;
+      ActuatorState options[] = {FORWARD, BRAKE, REVERSE};
+      actuatorState = options[random(0, 3)];
+      setRandomDuration(actuatorState);
+    }
+    break;
+
+  case BRAKE:
+    if (now - actuatorTimer < breakDuration) {
+      ledcWrite(AIN1_CH, 255);
+      ledcWrite(AIN2_CH, 255);
+    } else {
+      actuatorTimer = now;
+      ActuatorState options[] = {FORWARD, COAST, REVERSE};
+      actuatorState = options[random(0, 3)];
+      setRandomDuration(actuatorState);
+    }
+    break;
+}
+//unsigned long nowLed = millis();
+//updateLEDsForActuatorStateBlink(nowLed);
+updateLEDsForActuatorState();
+
+
+  }
+#endif
+
+#ifdef TEST
+
+
+int actuatorINA = 0;
+int actuatorINB = 0;  
+int delayValue = 0;
+//int burstValue = 255;
+void loop(){
+ static bool started = false;
+ static bool accelerated = false;
+ static bool actuatorInitialized = false;
+ static bool onlyZCtest = false;
+
+  if (!started) {  // example: wait 3 sec then start
+    startMotor();
+    //startMotorZC();
+    started = true;
+  }
+
+  // Keep adjusting delay while running
+  if (started && !usingZeroCross && !onlyZCtest) {
+    int newDelay_us = getSmoothDelay_us();
+    if (newDelay_us >= minDelay_us + 2500 && !accelerated) {
+      currentDelay_us = newDelay_us;
+      portENTER_CRITICAL(&timerMux);
+      timerAlarmDisable(timer);
+      timerAlarmWrite(timer, newDelay_us, true);
+      timerAlarmEnable(timer);
+      portEXIT_CRITICAL(&timerMux);
+      //Serial.println("Current delay us: " + String(currentDelay_us));
+    }
+    else if (newDelay_us <= minDelay_us + 2500) {
+      accelerated = true;
+      usingZeroCross = true;
+      //digitalWrite(LED_BUILTIN, HIGH);
+      //Serial.println("Accelerated: " + String(accelerated));
+      timerAlarmDisable(timer);
+      pwmValue = min(PWM_DUTY + 50, PWM_MAX);
+      currentStep = step;
+      applyCommutationStep(currentStep);
+    }
+  }
+  if (onlyZCtest && !usingZeroCross && started) {
+      accelerated = true;
+      usingZeroCross = true;
+      digitalWrite(LED_BUILTIN, HIGH);
+      //Serial.println("Accelerated: " + String(accelerated));
+      timerAlarmDisable(timer);
+      pwmValue = min(PWM_DUTY + 50, PWM_MAX);
+      currentStep = step;
+      applyCommutationStep(currentStep);
+    }
+  if (commutationFlag  && accelerated ) {
+      //Serial.println("Next step: " + String(nextStep));
+      currentStep = nextStep;
+      applyCommutationStep(nextStep);
+      commutationFlag = false;
+    }
+ 
+  if (Serial.available()){
+    char c = Serial.read();
+    if (c == 'u') {
+      actuatorINA += 10;
+      actuatorINA = constrain(actuatorINA, 0, 255);
+      Serial.println("Actuator INA: " + String(actuatorINA));
+      ledcWrite(AIN1_CH, actuatorINA);
+    }
+    if (c == 'i') {
+      actuatorINA -= 10;
+      actuatorINA = constrain(actuatorINA, 0, 255);
+      Serial.println("Actuator INA: " + String(actuatorINA));
+      ledcWrite(AIN1_CH, actuatorINA);
+    }
+    if (c == 'j') {
+      actuatorINB += 10;
+      actuatorINB = constrain(actuatorINB, 0, 255);
+      Serial.println("Actuator INB: " + String(actuatorINB));
+      ledcWrite(AIN2_CH, actuatorINB);
+    }
+    if (c == 'k') {
+      actuatorINB -= 10;
+      actuatorINB = constrain(actuatorINB, 0, 255);
+      Serial.println("Actuator INB: " + String(actuatorINB));
+      ledcWrite(AIN2_CH, actuatorINB);
+    }
+    if (c == 'a') {
+      ledcWrite(AIN1_CH, burstValue);
+      delay(delayValue);
+      ledcWrite(AIN1_CH, actuatorINA);
+      ledcWrite(AIN2_CH, actuatorINB);
+      Serial.println("Actuator INA: " + String(actuatorINA));
+      Serial.println("Actuator INB: " + String(actuatorINB));
+      Serial.println("Delay: " + String(delayValue));
+      Serial.println("Burst: " + String(burstValue));
+    }
+    if (c == 'b') {
+      ledcWrite(AIN2_CH, burstValue);
+      delay(delayValue);
+      ledcWrite(AIN1_CH, actuatorINA);
+      ledcWrite(AIN2_CH, actuatorINB);
+      Serial.println("Actuator INA: " + String(actuatorINA));
+      Serial.println("Actuator INB: " + String(actuatorINB));
+      Serial.println("Delay: " + String(delayValue));
+      Serial.println("Burst: " + String(burstValue));
+    }
+    if ( c == 's') {
+      ledcWrite(AIN1_CH, 0);
+      ledcWrite(AIN2_CH, 0);
+      Serial.println("Stop");
+    }
+
+    if (c == 'w') {
+      delayValue += 10;
+      Serial.println("Time: " + String(delayValue));
+    }
+    if (c == 'q') {
+      delayValue -= 10;
+      Serial.println("Time: " + String(delayValue));
+    }
+    if (c == 'e') {
+      burstValue += 10;
+      Serial.println("Burst: " + String(burstValue));
+    }
+    if (c == 'r') {
+      burstValue -= 10;
+      Serial.println("Burst: " + String(burstValue));
+    }
+
+  }
+
+}
+
+#endif
+//  for (int i = 0; i < NUM_LEDS; i++) {
+//    uint32_t color = Wheel((i * 256 / NUM_LEDS + millis() / 10) & 255);
+//    strip.setPixelColor(i, color);
+//  }
+//  strip.show();
+//  delay(20);
+//
+
+
+
+//  if (accelerated)  {
+//    
+//    digitalWrite(AIN1, HIGH);
+//    digitalWrite(AIN2, LOW);                 //Actuator test
+//    delay(3000); // run forward for 3 seconds//  delay(2000);
+//                                             //
+//    // Brake                                 //  if (!running) {
+//    digitalWrite(AIN1, LOW);                 //    startActuator();  // Start actuator once
+//    digitalWrite(AIN2, LOW);                 //  }
+//    delay(1000);                             //
+//                                             //  speedUp();  // Increase speed every 2 sec
+//    // Retract                               //
+//    digitalWrite(AIN1, LOW);                 //  if (pwmValue >= 255) {
+//    digitalWrite(AIN2, HIGH);                //    delay(1000);
+//    delay(3000);                             //    stopActuator();
+//                                             //    delay(1000);
+//    // Brake again                           //    reverseDirection();
+//    digitalWrite(AIN1, LOW);                 //    startActuator();  // Restart in new direction
+//    digitalWrite(AIN2, LOW);                 //    pwmValue = 0;     // Optional: ramp up again
+//    delay(1000);                             //  }
+//    //}
+//    }
+
+
+ //if (!usingZeroCross) {
+    //Serial.println("Open-loop mode");
+    //int delayNow = getSmoothDelay_us();
+
+
+    //if (abs(delayNow - currentDelay_us) > 100) {
+      //currentDelay_us = delayNow;
+      //Serial.println("New delay: " + String(currentDelay_us));
+    //}
+
+    //runPWM(currentDelay_us);  // Blocking loop for acceleration
+
+    //if (currentDelay_us <= minDelay_us + 1000) {
+      //usingZeroCross = true;
+      //Serial.println("Switching to ZC mode");
+
+      //timerAlarmDisable(timer);  // Stop the open-loop PWM ISR
+      
+      //pwmValue = min(PWM_DUTY + 50, PWM_MAX); // Or some ramp logic
+
+      //// Sync step and begin ZC commutation
+      //currentStep = step;
+      //applyCommutationStep(currentStep);
+    //}
+  //}
+  //if (commutationFlag) {
+  ////Serial.println("ZC mode");
+  //applyCommutationStep(nextStep);
+  //currentStep = nextStep;
+  //commutationFlag = false;
+  //}
+//}
+
+//void loop() {
+//  if (!usingZeroCross) {
+//    Serial.println("Open-loop mode");
+//
+//    // Optional: Gradual decay
+//    int targetDelay = getSmoothDelay_us();
+//    if (currentDelay_us > targetDelay) {
+//      currentDelay_us -= 100;
+//      if (currentDelay_us < targetDelay) currentDelay_us = targetDelay;
+//      Serial.println("New delay: " + String(currentDelay_us));
+//    }
+//
+//    runPWM(currentDelay_us);
+//
+//    if (currentDelay_us <= minDelay_us + 500) {
+//      usingZeroCross = true;
+//      Serial.println("Switching to ZC mode");
+//
+//      timerAlarmDisable(timer);
+//      pwmValue = min(PWM_DUTY + 50, PWM_MAX);
+//      currentStep = step;
+//      applyCommutationStep(currentStep);
+//    }
+//  }
+//
+//  if (commutationFlag) {
+//    applyCommutationStep(nextStep);
+//    currentStep = nextStep;
+//    commutationFlag = false;
+//    Serial.println("New step: " + String(currentStep));
+//  }
+//}
+//
+
+//  void loop() {
+  //if (!usingZeroCross) {
+    //Serial.println("Open-loop mode");
+    //int delayNow = getSmoothDelay_us();
+
+
+    //if (abs(delayNow - currentDelay_us) > 100) {
+      //currentDelay_us = delayNow;
+      //Serial.println("New delay: " + String(currentDelay_us));
+    //}
+
+    //runPWM(currentDelay_us);  // Blocking loop for acceleration
+
+    //if (currentDelay_us <= minDelay_us + 1000) {
+      //usingZeroCross = true;
+      //Serial.println("Switching to ZC mode");
+
+      //timerAlarmDisable(timer);  // Stop the open-loop PWM ISR
+      
+      //pwmValue = min(PWM_DUTY + 50, PWM_MAX); // Or some ramp logic
+
+      //// Sync step and begin ZC commutation
+      //currentStep = step;
+      //applyCommutationStep(currentStep);
+    //}
+  //}
+  //if (commutationFlag) {
+  ////Serial.println("ZC mode");
+  //applyCommutationStep(nextStep);
+  //currentStep = nextStep;
+  //commutationFlag = false;
+  //}
+//}
+//  if (!usingZeroCross) {
+    //int delayNow = getSmoothDelay_us();
+
+    //if (abs(delayNow - currentDelay_us) > 100) {
+      //currentDelay_us = delayNow;
+
+      //portENTER_CRITICAL(&timerMux);
+      //timerAlarmWrite(timer, currentDelay_us, true);
+      //portEXIT_CRITICAL(&timerMux);
+    //}
+  //}
+//}
+
+//void loop() {
+
+      // Brake
+
+
+//void loop() {
+//  for (int i = 0; i <= 255; i += 5) {
+//    setLedStripBrightness(i);
+//    delay(20);
+//  }
+//
+//  for (int i = 255; i >= 0; i -= 5) {
+//    setLedStripBrightness(i);
+//    delay(20);
+//  }
+//}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
