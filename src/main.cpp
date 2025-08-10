@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include <Adafruit_DotStar.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <stdint.h>
 
 // Pin assignments
 #define HIN1 25
@@ -117,9 +120,10 @@ float rampK = 0.65;   // slope control
 unsigned long lastBlinkTime = 0;
 bool ledOn = false;
 const unsigned long blinkInterval = 18; // 100 ms = 10 blinks/sec
-
-
 int currentDelay_us = 3000;  // start slow
+
+uint8_t slaveAddress_1[] = { 0xA0, 0xB7, 0x65, 0x49, 0xC8, 0x54 };
+uint8_t slaveAddress_2[] = { 0xC8, 0xF0, 0x9E, 0x51, 0x97, 0x9C };
 
 // 6-step commutation table (digital fallback)
 const int8_t commutationTable[6][6] = {
@@ -162,6 +166,18 @@ char burstChannel = 0; // 'A' or 'B'
 unsigned long burstDuration = 60;
 unsigned long burstValue = 125;
 bool bursting = false;
+
+//typedef struct ledMessage {
+  //uint8_t r;
+  //uint8_t g;
+  //uint8_t b;
+  //float brightness;  
+  //} ledMessage;
+
+typedef struct __attribute__((packed)) {
+  uint8_t r, g, b;
+  float   brightness;   // 0.0 .. 1.0
+} ledMessage;
 
 void setHIN(uint8_t phase, bool on) {
   uint8_t pin = (phase == 0) ? HIN1 : (phase == 1) ? HIN2 : HIN3;
@@ -492,6 +508,22 @@ uint32_t Wheel(byte WheelPos) {
   }
 }
 
+void sendColorToSlave(uint32_t color, float brightness)
+{
+  ledMessage msg;
+  msg.r = (color >> 16) & 0xFF;
+  msg.g = (color >>  8) & 0xFF;
+  msg.b =  color        & 0xFF;
+  msg.brightness = brightness;           // if using float version
+  // msg.brightness = (uint8_t)(brightness * 255); // if using uint8_t version
+
+  esp_err_t result = esp_now_send(slaveAddress_1, (uint8_t*)&msg, sizeof(msg));
+  if (result != ESP_OK) {
+    Serial.println("Failed to send color");
+  }
+}
+
+
 void updateLEDsForActuatorState() {
   uint32_t color;
   switch (actuatorState) {
@@ -506,7 +538,16 @@ void updateLEDsForActuatorState() {
     strip.setPixelColor(i, color);
   }
   strip.show();
+  
+  float brightness = 0.5;
+  static uint32_t lastColor = 0;
+  if (color != lastColor) {
+  sendColorToSlave(color, brightness);
+  lastColor = color;
+  }
 }
+
+
 
 void updateLEDsForActuatorStateBlink(unsigned long now) {
   if (actuatorState == FORWARD) {
@@ -537,6 +578,32 @@ void setLedStripBrightness(uint8_t brightness) {
   // brightness: 0 (off) to 255 (full brightness)
   ledcWrite(LED_STRIP_CHANNEL, brightness);
 }
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("Send Status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+void setupESPNow() {
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+    esp_now_register_send_cb(onDataSent);
+
+    esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, slaveAddress_1, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+  }
+}
+
+void sendLEDColor(uint8_t r, uint8_t g, uint8_t b, float brightness) {
+  ledMessage msg = { r, g, b, brightness };
+  esp_now_send(slaveAddress_1, (uint8_t *) &msg, sizeof(msg));
+}
 
 void setup() {
   Serial.begin(115200);
@@ -556,7 +623,7 @@ void setup() {
   
   digitalWrite(ENABLE, HIGH);
   
-  
+  setupESPNow();
   alignRotorHold(1000);  // Pre-position the rotor before startup
   //alignRotorCycle(3000);
   #ifdef ZC
@@ -651,11 +718,11 @@ void loop() {
       accelerated = true;
       //usingZeroCross = true;
       //digitalWrite(LED_BUILTIN, HIGH);
-      Serial.println("Accelerated: " + String(accelerated));
+      //Serial.println("Accelerated: " + String(accelerated));
       //timerAlarmDisable(timer);
       pwmValue = min(PWM_DUTY + 50, PWM_MAX);
       currentStep = step;
-      applyCommutationStep(currentStep);
+      //applyCommutationStep(currentStep);
     }
   }
   if (onlyZCtest && !usingZeroCross && started) {
@@ -666,12 +733,12 @@ void loop() {
       timerAlarmDisable(timer);
       pwmValue = min(PWM_DUTY + 50, PWM_MAX);
       currentStep = step;
-      applyCommutationStep(currentStep);
+      //applyCommutationStep(currentStep);
     }
   if (commutationFlag  && accelerated ) {
       Serial.println("Next step: " + String(nextStep));
       currentStep = nextStep;
-      applyCommutationStep(nextStep);
+      //applyCommutationStep(nextStep);
       commutationFlag = false;
     }
   
