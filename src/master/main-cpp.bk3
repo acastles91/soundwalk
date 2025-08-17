@@ -10,19 +10,18 @@
 #include <motion.h>    // BLDC module
 #include <actuator.h>  // DRV8833 module
 #include <pins.h>      // pin/channel definitions
-#include "center.h"
-#include "routine.h"
 
 // -------------------- Local DotStar (optional visual) --------------------
 #define MASTER_NUM_LEDS 30
 Adafruit_DotStar strip(MASTER_NUM_LEDS, MASTER_DATAPIN, MASTER_CLOCKPIN, DOTSTAR_BRG);
-// ---------- Center (push-pull) dither control ----------
-
-//CENTER  OFF  power=20 pulse=400 gap=40 bias=-3 brake=off(160)
 // ---- Logging toggles ----
 static bool g_routine_log = true;   // routine state machine logs (default ON)
 static bool g_center_log  = false;  // center dither logs (default OFF)
 
+
+
+
+// ---------- Center (push-pull) dither control ----------
 struct CenterCfg {
   int      power        = 90;    // base duty (0..255) for each pulse
   uint16_t pulse_ms     = 25;    // ON duration per pulse
@@ -38,9 +37,6 @@ static bool      g_center_on = false;
 enum class CenterState { Idle, PulseFwd, Gap1, PulseRev, Gap2 };
 static CenterState g_cstate = CenterState::Idle;
 static uint32_t    g_ctmr   = 0;
-
-// ---- forward declaration used by center_set_state ----
-static const char* centerName(CenterState s);
 
 static inline void center_set_state(CenterState ns, uint32_t now){
   if (ns != g_cstate){
@@ -67,7 +63,6 @@ static void center_off() {
   g_cstate    = CenterState::Idle;
   actuator::coast();
 }
-
 static void center_tick() {
   if (!g_center_on) return;
   uint32_t now = millis();
@@ -118,6 +113,128 @@ static void center_tick() {
   }
 }
 
+// ---------- Auto routine that uses CENTER during Forward ----------
+struct RoutineCfg {
+  uint16_t fwd_ms    = 2500; // CENTER active
+  uint16_t coast_ms  = 200;
+  uint16_t brake_ms  = 120;
+  uint16_t rev_ms    = 180;
+  uint16_t settle_ms = 25;   // <<< NEW: neutral dwell before CENTER turns on
+  int      runDuty   = 70;   // reverse strength
+  uint8_t  brakeDuty = 160;  // brake duty in Brake phase
+};
+
+static RoutineCfg g_routine;
+enum class RoutineState { Idle, FwdSettle, FwdCenter, Coast, Brake, Reverse };
+static bool         g_routine_on = false;
+static RoutineState g_rstate     = RoutineState::Idle;
+static uint32_t     g_rtmr       = 0;
+
+static void routine_enter(RoutineState s) {
+  g_rstate = s;
+  g_rtmr   = millis();
+
+  if (g_routine_log) {
+    Serial.printf("ROUTINE -> %s  t=%lu ms\n", routineName(s), (unsigned long)g_rtmr);
+  }
+
+  actuator::enableAuto(false);
+  center_off(); // CENTER only runs in FwdCenter
+
+  switch (s) {
+    case RoutineState::Idle:
+      actuator::coast();
+      break;
+
+    case RoutineState::FwdSettle:
+      actuator::coast(); // (or brake) small neutral dwell
+      break;
+
+    case RoutineState::FwdCenter:
+      // Log current center config once when we enter this phase
+      if (g_routine_log) {
+        Serial.printf("CENTER cfg: power=%d pulse=%u gap=%u bias=%d brake=%s(%u)\n",
+          g_center.power, g_center.pulse_ms, g_center.gap_ms, g_center.bias,
+          g_center.useBrake ? "on" : "off", g_center.brakeDuty);
+      }
+      center_on();
+      break;
+
+    case RoutineState::Coast:
+      actuator::coast();
+      break;
+
+    case RoutineState::Brake:
+      actuator::brake(g_routine.brakeDuty);
+      break;
+
+    case RoutineState::Reverse:
+      actuator::drive(-constrain(g_routine.runDuty, 0, 255));
+      break;
+  }
+}
+
+
+static void routine_start() {
+  g_routine_on = true;
+  routine_enter(RoutineState::FwdSettle);  // <<< start with settle
+  Serial.println("ROUTINE: on");
+}
+
+static void routine_stop() {
+  g_routine_on = false;
+  routine_enter(RoutineState::Idle);
+  Serial.println("ROUTINE: off");
+}
+
+static void routine_tick() {
+  if (!g_routine_on) return;
+  const uint32_t now = millis();
+
+  switch (g_rstate) {
+    case RoutineState::Idle:
+      routine_enter(RoutineState::FwdSettle);
+      break;
+
+    case RoutineState::FwdSettle: // <<< NEW
+      if (now - g_rtmr >= g_routine.settle_ms)
+        routine_enter(RoutineState::FwdCenter);
+      break;
+
+    case RoutineState::FwdCenter:
+      if (now - g_rtmr >= g_routine.fwd_ms)
+        routine_enter(RoutineState::Coast);
+      break;
+
+    case RoutineState::Coast:
+      if (now - g_rtmr >= g_routine.coast_ms)
+        routine_enter(RoutineState::Brake);
+      break;
+
+    case RoutineState::Brake:
+      if (now - g_rtmr >= g_routine.brake_ms)
+        routine_enter(RoutineState::Reverse);
+      break;
+
+    case RoutineState::Reverse:
+      if (now - g_rtmr >= g_routine.rev_ms)
+        routine_enter(RoutineState::FwdSettle); // go through settle every time
+      break;
+  }
+}
+
+// ---- Friendly names for states ----
+static const char* routineName(RoutineState s){
+  switch (s){
+    case RoutineState::Idle:      return "Idle";
+    case RoutineState::FwdSettle: return "FwdSettle";
+    case RoutineState::FwdCenter: return "FwdCenter";
+    case RoutineState::Coast:     return "Coast";
+    case RoutineState::Brake:     return "Brake";
+    case RoutineState::Reverse:   return "Reverse";
+  }
+  return "?";
+}
 
 static const char* centerName(CenterState s){
   switch (s){
@@ -440,17 +557,14 @@ static void handleActuatorCommand(const String& line){
     Serial.printf("AUTO brakeDuty=%d\n", cfg.brakeDuty);
     return;
   }
-
-  // quick preset to what you liked
   if (t[0] == "center" && n>=2 && t[1] == "preset") {
     g_center.power = 15; g_center.pulse_ms = 200; g_center.gap_ms = 1;
     g_center.bias  = -2; g_center.useBrake = true; g_center.brakeDuty = 160;
-    actuator::enableAuto(false);
     center_on();
+    actuator::enableAuto(false);
     Serial.println("CENTER preset restored & enabled.");
     return;
   }
-
   if (t[0] == "status"){ actuator::debugPrint(Serial); return; }
 
   // LED / chain commands (also line-based)
@@ -481,59 +595,107 @@ static void handleActuatorCommand(const String& line){
     printHelp();
     return;
   }
+  if (t[0] == "center") {
+    if (n>=3 && t[1] == "log") {
+      if (t[2] == "on")  { g_center_log = true;  Serial.println("CENTER log=on");  return; }
+      if (t[2] == "off") { g_center_log = false; Serial.println("CENTER log=off"); return; }
+  } 
 
-  if (t[0] == "mbringup"){
-    Serial.println("Manual 6-step bring-up…");
-    motorBringUpOnce();
+  if (n>=2 && t[1] == "on") {
+    actuator::enableAuto(false);
+    center_on();
+    Serial.printf("CENTER on  power=%d pulse=%ums gap=%ums bias=%d brake=%s(%u)\n",
+      g_center.power, g_center.pulse_ms, g_center.gap_ms, g_center.bias,
+      g_center.useBrake ? "on" : "off", g_center.brakeDuty);
+    return;
+  }
+  if (n>=2 && t[1] == "off") { center_off(); Serial.println("CENTER off"); return; }
+  if (n>=3 && t[1] == "power") { g_center.power = constrain((int)toLong(t[2], g_center.power), 0, 255); Serial.printf("CENTER power=%d\n", g_center.power); return; }
+  if (n>=3 && t[1] == "pulse") { g_center.pulse_ms = (uint16_t)max(1L, toLong(t[2], g_center.pulse_ms)); Serial.printf("CENTER pulse=%u ms\n", g_center.pulse_ms); return; }
+  if (n>=3 && t[1] == "gap")   { g_center.gap_ms   = (uint16_t)max(0L, toLong(t[2], g_center.gap_ms));   Serial.printf("CENTER gap=%u ms\n", g_center.gap_ms);     return; }
+  if (n>=3 && t[1] == "bias")  { g_center.bias     = (int8_t)constrain((int)toLong(t[2], g_center.bias), -127, 127); Serial.printf("CENTER bias=%d\n", g_center.bias); return; }
+  if (n>=3 && t[1] == "brake") {
+    if (t[2] == "on")  { g_center.useBrake = true;  Serial.println("CENTER brake=on");  return; }
+    if (t[2] == "off") { g_center.useBrake = false; Serial.println("CENTER brake=off"); return; }
+    g_center.brakeDuty = (uint8_t)constrain((int)toLong(t[2], g_center.brakeDuty), 0, 255);
+    Serial.printf("CENTER brake duty=%u\n", g_center.brakeDuty);
+    return;
+  }
+  if (n>=2 && t[1] == "status") {
+    Serial.printf("CENTER %s power=%d pulse=%u gap=%u bias=%d brake=%s(%u)\n",
+      g_center_on?"ON":"OFF", g_center.power, g_center.pulse_ms, g_center.gap_ms,
+      g_center.bias, g_center.useBrake?"on":"off", g_center.brakeDuty);
+    return;
+  }
+  Serial.println(
+    "center on|off\n"
+    "center power N      (0..255)\n"
+    "center pulse ms     (e.g. 25)\n"
+    "center gap ms       (e.g. 30)\n"
+    "center bias B       (-127..+127)\n"
+    "center brake on|off or center brake N\n"
+    "center status"
+  );
+  return;
+  // In handleActuatorCommand(...)
+}
+if (t[0] == "routine") {
+  if (n>=2 && t[1]=="on")  { routine_start(); return; }
+  if (n>=2 && t[1]=="off") { routine_stop();  return; }
+
+  if (n>=3 && t[1]=="duty") {
+    g_routine.runDuty = constrain((int)toLong(t[2], g_routine.runDuty), 0, 255);
+    Serial.printf("ROUTINE runDuty=%d\n", g_routine.runDuty);
+    return;
+  }
+  if (n>=3 && t[1]=="brake") {
+    g_routine.brakeDuty = (uint8_t)constrain((int)toLong(t[2], g_routine.brakeDuty), 0, 255);
+    Serial.printf("ROUTINE brakeDuty=%u\n", g_routine.brakeDuty);
+    return;
+  }
+  if (n>=4 && t[1]=="set") {
+    uint16_t ms = (uint16_t)max(0L, toLong(t[3], 0));
+    if      (t[2]=="f") g_routine.fwd_ms   = ms;
+    else if (t[2]=="c") g_routine.coast_ms = ms;
+    else if (t[2]=="k") g_routine.brake_ms = ms;
+    else if (t[2]=="r") g_routine.rev_ms   = ms;
+    else { Serial.println("ROUTINE set needs f|c|k|r <ms>"); return; }
+    Serial.printf("ROUTINE %s=%u ms\n", t[2].c_str(), ms);
+    return;
+  }
+  if (n>=2 && t[1]=="status") {
+    Serial.printf("ROUTINE %s  fwd=%u  coast=%u  brake=%u  rev=%u  duty=%d  brk=%u\n",
+      g_routine_on?"ON":"OFF",
+      g_routine.fwd_ms, g_routine.coast_ms, g_routine.brake_ms, g_routine.rev_ms,
+      g_routine.runDuty, g_routine.brakeDuty);
+    Serial.printf("CENTER  %s  power=%d pulse=%u gap=%u bias=%d brake=%s(%u)\n",
+      g_center_on?"ON":"OFF", g_center.power, g_center.pulse_ms, g_center.gap_ms,
+      g_center.bias, g_center.useBrake?"on":"off", g_center.brakeDuty);
     return;
   }
 
-  if (t[0] == "routine") {
-    // routine log on|off
-if (n>=3 && t[1]=="log") {
-  bool on = (t[2] == "on");
-  routine::set_log(on);
-  Serial.printf("ROUTINE log=%s\n", on ? "on" : "off");
+  Serial.println(
+    "routine on|off\n"
+    "routine set f|c|k|r <ms>\n"
+    "routine duty N\n"
+    "routine brake N\n"
+    "routine status"
+  );
   return;
+
 }
-
-// routine dur <state> <min> <max>
-if (n>=5 && t[1]=="dur") {
-  routine::State s;
-  if      (t[2]=="idle")   s = routine::State::Idle;
-  else if (t[2]=="settle") s = routine::State::FwdSettle;
-  else if (t[2]=="fwd")    s = routine::State::FwdCenter;
-  else if (t[2]=="coast")  s = routine::State::Coast;
-  else if (t[2]=="brake")  s = routine::State::Brake;
-  else if (t[2]=="rev")    s = routine::State::Reverse;
-  else { Serial.println("States: idle|settle|fwd|coast|brake|rev"); return; }
-
-  uint16_t mn = (uint16_t)max(0L, toLong(t[3], 0));
-  uint16_t mx = (uint16_t)max(0L, toLong(t[4], 0));
-  routine::set_duration(s, mn, mx);
-  Serial.printf("ROUTINE dur(%s)=%u..%u ms\n", t[2].c_str(), mn, mx);
-  return;
-}
-
-    if (n>=3 && t[1]=="duty") {
-    routine::set_run_duty(constrain((int)toLong(t[2], routine::run_duty()), 0, 255));
-    Serial.printf("ROUTINE runDuty=%d\n", routine::run_duty());
-    return;
+if (t[0] == "routine" && n>=2) {
+  if (t[1] == "log" && n>=3){
+    if (t[2] == "on")  { g_routine_log = true;  Serial.println("ROUTINE log=on");  return; }
+    if (t[2] == "off") { g_routine_log = false; Serial.println("ROUTINE log=off"); return; }
   }
-  if (n>=2 && t[1]=="on")     { routine::start();           return; }
-  if (n>=2 && t[1]=="off")    { routine::stop();            return; }
-  if (n>=2 && t[1]=="pause")  { routine::pause(true);       return; }
-  if (n>=2 && t[1]=="resume") { routine::pause(false);      return; }
-
-  // If your API is status(), call it with no args; 
-  // if it's status(Stream&), use status(Serial) instead.
-  if (n>=2 && t[1]=="status") { routine::status(Serial);          return; }
-
-  Serial.println("Usage: routine on|off|pause|resume|status");
-  return;
+  // (you can also expose settle_ms etc. here if you haven’t already)
 }
+     
+  if (t[0] == "mbringup"){ Serial.println("Manual 6-step bring-up…"); motorBringUpOnce(); 
+    return; }
 
-  // Single-letter convenience (still line-based)
+  // convenience: accept single-letter lines as commands (still line-based)
   if (t[0].length()==1 && n==1){
     char k = t[0][0];
     if (k=='b'){ startBreathAll(0,0,255, 0.05f,0.7f, 1000,1200, 0, true); Serial.println("BREATH: blue");  return; }
@@ -589,21 +751,23 @@ void setup() {
   motion::setup(mcfg);
   motion::startOpenLoop();
 
-  // --- ACTUATOR (DRV8833) ---
+      // --- ACTUATOR (DRV8833) ---
   actuator::setup(AIN1, AIN2, AIN1_CH, AIN2_CH, /*freq*/40, /*res*/8);
   actuator::AutoConfig acfg;
   actuator::setAutoConfig(acfg);
-  actuator::enableAuto(false);   // let center dither own the coil
+  actuator::enableAuto(false);   // <-- let center dither own the coil
 
   // Center dither preset (your tuned values)
-//  g_center.power     = 15;
-//  g_center.pulse_ms  = 200;
-//  g_center.gap_ms    = 1;
-//  g_center.bias      = -2;
-//  g_center.useBrake  = true;
-//  g_center.brakeDuty = 160;
+  g_center.power     = 10;
+  g_center.pulse_ms  = 150;
+  g_center.gap_ms    = 1;
+  g_center.bias      = -2;
+  g_center.useBrake  = true;
+  g_center.brakeDuty = 160;
 
-  Serial.println("CENTER preset: power=15 pulse=200 gap=1 bias=-2 brake=on(160)");
+  //center_on();
+  Serial.println("CENTER preset: on  power=15 pulse=200 gap=1 bias=-2 brake=on(160)");
+
 
   // Default breath: visual confirmation after boot
   startBreathAll(0,0,255, 0.05f,0.6f, 1200,1400, 0, true);
@@ -611,44 +775,19 @@ void setup() {
   fillStrip(0,0,40);
   printHelp();
 
-  randomSeed(esp_random());
-  //routine::start();   // start the routine cycleo
-
-  // Center preset you liked:
-  center::Cfg c{ /*power*/15, /*pulse_ms*/200, /*gap_ms*/1,
-               /*bias*/-2, /*useBrake*/true, /*brakeDuty*/160 };
-  center::init(c);
-// Don’t start here if you only want it inside the routine:
-// center::on();
-
-  randomSeed(esp_random());
-  //routine::set_run_duty(70);
-  //routine::set_brake_duty(160);
-
-  // center preset + init (already in your code)
-
-// If your center module exposes logging (add center::set_log if it doesn't yet):
-// center::set_log(true);
-
-routine::init();
-routine::set_log(true);     // <= make sure logs are enabled
-// routine::set_random(true);  // optional, if you gate randomness
-routine::start();
-
+  routine_start();
 }
 
 void loop() {
   const uint32_t now = millis();
 
-  handleConsoleInput();
 
+  handleConsoleInput();
+  
   motion::tick();
   actuator::tick();
-  //center_tick();
-  //routine_tick();   // run the high-level cycle
-
-  center::tick();
-  routine::tick();
+  center_tick();
+  routine_tick();   // run the high-level cycle
 
   static uint32_t led_ms = 0;
   if (now - led_ms > 500) {
@@ -656,4 +795,5 @@ void loop() {
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
   }
 }
+
 
