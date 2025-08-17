@@ -1,8 +1,12 @@
 #include <Arduino.h>
+
 #include <Adafruit_DotStar.h>
 #include <esp_now.h>
 #include <WiFi.h>
 #include <stdint.h>
+#include "message.h"
+#include <math.h>
+
 
 // Pin assignments
 #define HIN1 25
@@ -68,8 +72,69 @@
 #define AIN1_CH 6
 #define AIN2_CH 7
 
+
+//ESP NOW
+static const uint8_t PEERS[][6] = {
+  {0xC0,0x5D,0x89,0xDC,0xA9,0xDC}, // Slave 0
+  {0xC0,0x5D,0x89,0xDC,0x94,0x2C}, // Slave 1
+  {0xC0,0x5D,0x89,0xDC,0xA9,0xC0}, // Slave 2
+  {0xC0,0x5D,0x89,0xDC,0x99,0x7C}, // Slave 3
+  {0xC0,0x5D,0x89,0xDC,0x98,0x08}, // Slave 4
+  {0x14,0x2B,0x2F,0xDD,0x69,0xA4}, // Slave 5
+  {0xC0,0x5D,0x89,0xDC,0x6E,0xC0}, // Slave 6
+  {0xC0,0x5D,0x89,0xDC,0x9A,0x9C}, // Slave 7
+  {0xC0,0x5D,0x89,0xDC,0x9B,0xD4}, // Slave 8
+  {0xC0,0x5D,0x89,0xDC,0x95,0xD0}, // Slave 9
+  {0xC0,0x5D,0x89,0xDC,0xA9,0x28}, // Slave 10
+  {0xC0,0x5D,0x89,0xDC,0x9B,0x24}, // Slave 11
+  {0xC0,0x5D,0x89,0xDC,0x98,0xB4}, // Slave 12
+  {0xC0,0x5D,0x89,0xDC,0xA9,0x2C}, // Slave 13
+  {0xC0,0x5D,0x89,0xDC,0x6C,0xCC}, // Slave 14
+  {0xC0,0x5D,0x89,0xDC,0x93,0x7C}, // Slave 15
+  {0xC0,0x5D,0x89,0xDC,0x7F,0x78}, // Slave 16
+  {0xC0,0x5D,0x89,0xDD,0x1E,0x74}, // Slave 17
+  {0xC0,0x5D,0x89,0xDC,0x92,0xFC}, // Slave 18
+  {0x3C,0x8A,0x1F,0x7D,0xA6,0xE4}, // Slave 19
+  {0x38,0x18,0x2B,0x8B,0x85,0xB0}, // Slave 20
+  {0x68,0x25,0xDD,0xFD,0x53,0xF4}, // Slave 21
+  {0x00,0x4B,0x12,0x33,0x68,0x24}, // Slave 22
+  {0x38,0x18,0x2B,0x8B,0x82,0x04}, // Slave 23
+  {0x00,0x4B,0x12,0x2E,0xEA,0x14}, // Slave 24
+  {0x38,0x18,0x2B,0x8A,0x2A,0xF8}, // Slave 25
+  {0x38,0x18,0x2B,0x8B,0xD6,0xBC}, // Slave 26
+  {0x68,0x25,0xDD,0xF1,0xB2,0x34}, // Slave 27
+  {0x68,0x25,0xDD,0xFD,0x18,0x90}, // Slave 28
+};
+
+// top-level (globals)
+static uint32_t g_seq = 1;       // monotonic
+static uint32_t last_retx_ms = 0;
+static BreathMsg last_cmd{};     // keep last command for re-broadcasts
+static bool have_last_cmd = false;
+
+// keep latest commands for late-joiners
+//static BreathMsg  last_cmd{};
+//static bool       have_last_cmd = false;
+//static uint32_t   last_retx_ms = 0;
+
+static FlickerMsg last_flicker{};
+static bool       have_last_flicker = false;
+static uint32_t   last_flicker_retx_ms = 0;
+
+
+static const size_t NUM_SLAVES = sizeof(PEERS)/sizeof(PEERS[0]);
+
+// Current breathing params for master’s own strip
+static BreathMsg currentBreath{};
+
+// --- same clamp/ease/breath/render as you already have ---
+static inline float clamp01(float x){ return x<0?0:(x>1?1:x); }
+static float ease_cos(float x){ return 0.5f*(1.0f - cosf(3.1415926f*x)); }
+
+
 Adafruit_DotStar strip(NUM_LEDS, DATAPIN, CLOCKPIN, DOTSTAR_BRG);
 
+static uint32_t g_flicker_seq = 1;
 
 // Acceleration variables
 hw_timer_t* timer = NULL;
@@ -166,18 +231,6 @@ char burstChannel = 0; // 'A' or 'B'
 unsigned long burstDuration = 60;
 unsigned long burstValue = 125;
 bool bursting = false;
-
-//typedef struct ledMessage {
-  //uint8_t r;
-  //uint8_t g;
-  //uint8_t b;
-  //float brightness;  
-  //} ledMessage;
-
-typedef struct __attribute__((packed)) {
-  uint8_t r, g, b;
-  float   brightness;   // 0.0 .. 1.0
-} ledMessage;
 
 void setHIN(uint8_t phase, bool on) {
   uint8_t pin = (phase == 0) ? HIN1 : (phase == 1) ? HIN2 : HIN3;
@@ -508,20 +561,20 @@ uint32_t Wheel(byte WheelPos) {
   }
 }
 
-void sendColorToSlave(uint32_t color, float brightness)
-{
-  ledMessage msg;
-  msg.r = (color >> 16) & 0xFF;
-  msg.g = (color >>  8) & 0xFF;
-  msg.b =  color        & 0xFF;
-  msg.brightness = brightness;           // if using float version
-  // msg.brightness = (uint8_t)(brightness * 255); // if using uint8_t version
-
-  esp_err_t result = esp_now_send(slaveAddress_1, (uint8_t*)&msg, sizeof(msg));
-  if (result != ESP_OK) {
-    Serial.println("Failed to send color");
-  }
-}
+//void sendColorToSlave(uint32_t color, float brightness)
+//{
+//  ledMessage msg;
+//  msg.r = (color >> 16) & 0xFF;
+//  msg.g = (color >>  8) & 0xFF;
+//  msg.b =  color        & 0xFF;
+//  msg.brightness = brightness;           // if using float version
+//  // msg.brightness = (uint8_t)(brightness * 255); // if using uint8_t version
+//
+//  esp_err_t result = esp_now_send(slaveAddress_1, (uint8_t*)&msg, sizeof(msg));
+//  if (result != ESP_OK) {
+//    Serial.println("Failed to send color");
+//  }
+//}
 
 
 void updateLEDsForActuatorState() {
@@ -539,38 +592,11 @@ void updateLEDsForActuatorState() {
   }
   strip.show();
   
-  float brightness = 0.5;
+  float brightness = 0.1;
   static uint32_t lastColor = 0;
   if (color != lastColor) {
-  sendColorToSlave(color, brightness);
-  lastColor = color;
-  }
-}
-
-
-
-void updateLEDsForActuatorStateBlink(unsigned long now) {
-  if (actuatorState == FORWARD) {
-    if (now - lastBlinkTime >= blinkInterval) {
-      lastBlinkTime = now;
-      ledOn = !ledOn;
-      uint32_t color = ledOn ? strip.Color(0, 0, 255) : strip.Color(0, 0, 0);
-      for (int i = 0; i < NUM_LEDS; i++) {
-        strip.setPixelColor(i, color);
-      }
-      strip.show();
-    }
-  } else if (actuatorState == COAST || actuatorState == BRAKE || actuatorState == REVERSE) {
-    // Optional: Set a static color
-    for (int i = 0; i < NUM_LEDS; i++) {
-      strip.setPixelColor(i, strip.Color(0, 0, 0));  // Dim blue, or adjust
-    }
-    strip.show();
-  } else { // IDLE
-    for (int i = 0; i < NUM_LEDS; i++) {
-      strip.setPixelColor(i, 0); // Off
-    }
-    strip.show();
+    //sendColorToSlave(color, brightness);
+    lastColor = color;
   }
 }
 
@@ -578,32 +604,191 @@ void setLedStripBrightness(uint8_t brightness) {
   // brightness: 0 (off) to 255 (full brightness)
   ledcWrite(LED_STRIP_CHANNEL, brightness);
 }
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  Serial.print("Send Status: ");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+
+float breath_brightness(uint32_t now, const BreathMsg& p){
+  if (p.mode != 1) return p.b_min;
+  if (now < p.t0_ms) return p.b_min;
+  uint32_t period = p.up_ms + p.down_ms;
+  if (!period) return p.b_min;
+  uint32_t elapsed = now - p.t0_ms;
+  if (p.cycles){
+    uint32_t total = (uint32_t)p.cycles * period;
+    if (elapsed >= total) return p.b_min;
+  }
+  uint32_t t = elapsed % period;
+  float a = (t < p.up_ms)
+              ? ease_cos((float)t / (float)p.up_ms)
+              : ease_cos(1.0f - (float)(t - p.up_ms) / (float)p.down_ms);
+  return p.b_min + (p.b_max - p.b_min) * a;
 }
-void setupESPNow() {
+
+void render_breath(uint32_t now, const BreathMsg& p){
+  float b = clamp01(breath_brightness(now, p));
+  uint8_t rr = (uint8_t)(p.r * b);
+  uint8_t gg = (uint8_t)(p.g * b);
+  uint8_t bb = (uint8_t)(p.b * b);
+  for (int i=0;i<NUM_LEDS;i++) strip.setPixelColor(i, rr, gg, bb);
+  strip.show();
+}
+
+// ---- ESP-NOW helpers ----
+static void addPeer(const uint8_t mac[6]){
+  esp_now_peer_info_t peer{};
+  memcpy(peer.peer_addr, mac, 6);
+  peer.channel = 0;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+}
+static void onDataSent(const uint8_t*, esp_now_send_status_t s){
+  Serial.println(s == ESP_NOW_SEND_SUCCESS ? "ESP-NOW send ok" : "ESP-NOW send fail");
+}
+static void setupESPNow(){
   WiFi.mode(WIFI_STA);
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
-    return;
+  if (esp_now_init() != ESP_OK) { Serial.println("ESP-NOW init error"); return; }
+  esp_now_register_send_cb(onDataSent);
+  // Only need to add the FIRST slave (others get it via forwarding)
+  if (NUM_SLAVES > 0) addPeer(PEERS[0]);
+}
+
+
+
+// ---- send breath to chain + set local params ----
+
+static void send_to_first_slave(const FlickerMsg& m) {
+  if (NUM_SLAVES > 0) {
+    esp_err_t err = esp_now_send(PEERS[0], (const uint8_t*)&m, sizeof(m));
+    if (err != ESP_OK) {
+      Serial.printf("send err=%d\n", err);
+    }
   }
-    esp_now_register_send_cb(onDataSent);
-
-    esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, slaveAddress_1, 6);
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
-
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("Failed to add peer");
+}
+static void send_to_first_slave(const BreathMsg m) {
+  if (NUM_SLAVES > 0) {
+    esp_err_t err = esp_now_send(PEERS[0], (const uint8_t*)&m, sizeof(m));
+    if (err != ESP_OK) {
+      Serial.printf("send err=%d\n", err);
+    }
   }
 }
 
-void sendLEDColor(uint8_t r, uint8_t g, uint8_t b, float brightness) {
-  ledMessage msg = { r, g, b, brightness };
-  esp_now_send(slaveAddress_1, (uint8_t *) &msg, sizeof(msg));
+void startBreathAll(uint8_t r,uint8_t g,uint8_t b,
+                    float bmin,float bmax,
+                    uint32_t up_ms,uint32_t down_ms,
+                    uint16_t cycles,
+                    bool interrupt = false,
+                    uint8_t ttl = 40,          // big enough for your chain
+                    uint32_t start_offset = 500 // ms in the future
+                    )
+{
+  BreathMsg msg{};
+  msg.mode    = MODE_BREATH;
+  msg.r = r; msg.g = g; msg.b = b;
+  msg.b_min   = clamp01(bmin);
+  msg.b_max   = clamp01(bmax);
+  if (msg.b_max < msg.b_min) { float t = msg.b_min; msg.b_min = msg.b_max; msg.b_max = t; }
+
+  msg.up_ms   = up_ms ? up_ms : 1;
+  msg.down_ms = down_ms ? down_ms : 1;
+  msg.cycles  = cycles;
+
+  msg.seq     = g_seq++;                // bump sequence
+  msg.flags   = interrupt ? F_INTERRUPT : 0;
+  msg.ttl     = ttl;
+  msg.t0_ms   = millis() + start_offset;
+
+  // Ship it
+  send_to_first_slave(msg);
+
+  // Apply locally (so master breathes in sync too)
+  currentBreath = msg;
+
+  // Save for periodic re-broadcasts
+  last_cmd      = msg;
+  have_last_cmd = true;
 }
+
+
+static void sendFlickerAll(uint16_t on_ms, uint16_t off_ms,
+                           uint16_t cycles, bool interrupt=false,
+                           uint8_t ttl=40, uint32_t start_offset=200)
+{
+  FlickerMsg m{};
+  m.mode   = MODE_FLICKER;
+  m.ttl    = ttl;
+  m.flags  = interrupt ? F_INTERRUPT : 0;
+  m.seq    = g_flicker_seq++;
+  m.t0_ms  = millis() + start_offset;
+  m.on_ms  = on_ms  ? on_ms  : 1;
+  m.off_ms = off_ms ? off_ms : 1;
+  m.cycles = cycles;     // 0 = continuous until another command
+  m.invert = 0;
+
+  if (NUM_SLAVES > 0) esp_now_send(PEERS[0], (const uint8_t*)&m, sizeof(m));
+}
+
+// Send a flicker command to all slaves; on_ms/off_ms define the blink,
+// cycles=0 runs forever, invert flips on/off, interrupt forces immediate update.
+void startFlickerAll(uint32_t on_ms,
+                     uint32_t off_ms,
+                     uint16_t cycles,
+                     bool invert = false,
+                     bool interrupt = false,
+                     uint8_t ttl = 40,
+                     uint32_t start_offset = 500)
+{
+    FlickerMsg m{};
+    m.mode   = MODE_FLICKER;
+    m.on_ms  = on_ms;
+    m.off_ms = off_ms;
+    m.cycles = cycles;
+    m.invert = invert;
+    m.seq    = g_seq++;
+    m.flags  = interrupt ? F_INTERRUPT : 0;
+    m.ttl    = ttl;
+    m.t0_ms  = millis() + start_offset;
+    // send only to the first slave; the slaves forward it
+    send_to_first_slave(m);
+    // Save for periodic re-broadcasts (same seq on purpose)
+    last_flicker       = m;
+    have_last_flicker  = true;
+}
+
+void updateLEDsForActuatorStateBlink(unsigned long now) {
+    static bool inBlink = false;
+    if (actuatorState == FORWARD) {
+        // Toggle the master’s LEDs locally
+        if (now - lastBlinkTime >= blinkInterval) {
+            lastBlinkTime = now;
+            ledOn = !ledOn;
+            strip.fill(ledOn ? strip.Color(0,0,255) : strip.Color(0,0,0));
+            strip.show();
+        }
+        // If this is the first frame of a new blink phase, start flicker on slaves
+        if (!inBlink) {
+            inBlink = true;
+            // send a flicker message: on/off equal to blinkInterval, infinite cycles
+            startFlickerAll(blinkInterval, blinkInterval, 0,
+                            /*invert=*/false,
+                            /*interrupt=*/true);
+        }
+    } else {
+        // Non‑FORWARD state: end blink
+        if (inBlink) {
+            inBlink = false;
+            // send a "clear flicker" message: one very short ON, then zero OFF, one cycle
+            startFlickerAll(1, 0, 1, /*invert=*/false, /*interrupt=*/true);
+        }
+        // fall back to steady colour
+        uint32_t colour =
+            actuatorState == REVERSE ? strip.Color(255,0,0) :
+            actuatorState == BRAKE   ? strip.Color(0,255,0) :
+            actuatorState == COAST   ? strip.Color(255,255,0) :
+                                       strip.Color(0,0,0);
+        strip.fill(colour);
+        strip.show();
+    }
+}
+
 
 void setup() {
   Serial.begin(115200);
@@ -676,6 +861,13 @@ void setup() {
   //applyCommutationStep(currentStep);
   strip.begin();
   strip.show();  // Initialize all pixels to 'off'
+
+  startBreathAll(
+  /*r*/   0,  /*g*/ 0,  /*b*/ 255,   // base color: blue
+  /*bmin*/0.05f,     /*bmax*/0.6f,   // min/max brightness
+  /*up_ms*/1200,     /*down_ms*/1400,
+  /*cycles*/0        // 0 = continuous
+);
 
   #ifdef TEST
   ledcSetup(AIN1_CH, ACTUATOR_PWM_FREQ, ACTUATOR_PWM_RESOLUTION);
@@ -841,10 +1033,43 @@ switch (actuatorState) {
     }
     break;
 }
-//unsigned long nowLed = millis();
-//updateLEDsForActuatorStateBlink(nowLed);
-updateLEDsForActuatorState();
+unsigned long nowLed = millis();
+updateLEDsForActuatorStateBlink(nowLed);
+//updateLEDsForActuatorState();
+//render_breath(millis(), currentBreath);
 
+//  if (have_last_cmd) {
+//    uint32_t now = millis();
+//    if (now - last_retx_ms > 3000) {      // every 3s
+//      last_retx_ms = now;
+//      send_to_first_slave(last_cmd);
+//    }
+//}
+// Periodically re-broadcast last BREATH so late joiners catch up
+if (have_last_cmd) {
+  uint32_t nowms = millis();
+  if (nowms - last_retx_ms > 2000) {   // every ~2s
+    last_retx_ms = nowms;
+
+    BreathMsg reb = last_cmd;          // copy
+    reb.t0_ms = nowms + 200;           // start a hair in the future
+    // Keep the SAME seq so already-synced slaves ignore this duplicate
+    send_to_first_slave(reb);
+  }
+}
+
+// Periodically re-broadcast last FLICKER too
+if (have_last_flicker) {
+  uint32_t nowms = millis();
+  if (nowms - last_flicker_retx_ms > 1000) { // ~1s
+    last_flicker_retx_ms = nowms;
+
+    FlickerMsg f = last_flicker;       // copy
+    f.t0_ms = nowms + 50;              // near-future start
+    // Keep the SAME seq so already-synced slaves ignore this duplicate
+    send_to_first_slave(f);
+  }
+}
 
   }
 #endif
