@@ -16,6 +16,9 @@ struct Spec {
   using FlickerFn = void(*)(uint32_t on_ms, uint32_t off_ms, uint16_t cycles, bool invert, bool interrupt);
   void set_flicker_cb(FlickerFn fn);
 
+  using StateCb = void(*)(State new_state, State old_state);
+  void set_state_cb(StateCb cb);
+
 
 // lifecycle
 void init();              // set default specs, not running

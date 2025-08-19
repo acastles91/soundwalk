@@ -16698,7 +16698,7 @@
 		(descr "SOIC, 8 Pin (https://www.analog.com/media/en/technical-documentation/data-sheets/ada4898-1_4898-2.pdf#page=29), generated with kicad-footprint-generator ipc_gullwing_generator.py")
 		(tags "SOIC SO")
 		(property "Reference" "U11"
-			(at 3.166 4.331 180)
+			(at 3.166 4.331 360)
 			(layer "F.SilkS")
 			(uuid "201d88b1-1ddc-4391-a4e0-13ea1a456cf8")
 			(effects

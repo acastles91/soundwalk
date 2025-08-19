@@ -1,22 +1,23 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
-#include <Wire.h>
-#include <message.h>
-#include <leds.h>
-#include <espnow.h>
 
-// -------------------- Hardware config --------------------
-#define NUM_LEDS    144
-#define DATAPIN     5
-#define CLOCKPIN    4
-#define SLAVE_INDEX 0
+#include <Adafruit_DotStar.h>
+#include <math.h>
 
-// Grouping (e.g., 1 on, 2 off, repeat)
-#define LED_SPACING   3
-#define LED_ON_COUNT  1
+#include <message.h>   // shared message types
+#include <motion.h>    // BLDC module
+#include <actuator.h>  // DRV8833 module
 
-// -------------------- ESP-NOW peers ----------------------
+#include <routine.h>
+#include <pins.h>      // pin/channel definitions
+
+#define FW_TAG "MASTER v0.7 (line console only)"
+// -------------------- Local DotStar (optional visual) --------------------
+#define MASTER_NUM_LEDS 30
+Adafruit_DotStar strip(MASTER_NUM_LEDS, MASTER_DATAPIN, MASTER_CLOCKPIN, DOTSTAR_BRG);
+
+// -------------------- ESP-NOW peers --------------------
 static const uint8_t PEERS[][6] = {
   {0xC0,0x5D,0x89,0xDC,0xA9,0xDC}, // Slave 0
   {0xC0,0x5D,0x89,0xDC,0x94,0x2C}, // Slave 1
@@ -48,184 +49,585 @@ static const uint8_t PEERS[][6] = {
   {0x68,0x25,0xDD,0xF1,0xB2,0x34}, // Slave 27
   {0x68,0x25,0xDD,0xFD,0x18,0x90}, // Slave 28
 };
-static const size_t NUM_SLAVES = sizeof(PEERS) / sizeof(PEERS[0]);
+static const size_t NUM_SLAVES = sizeof(PEERS)/sizeof(PEERS[0]);
 
-// -------------------- State ------------------------------
-portMUX_TYPE breathMux = portMUX_INITIALIZER_UNLOCKED;
+// -------------------- ESP-NOW helpers --------------------
+static uint32_t g_seq = 1;
+static uint32_t last_retx_ms = 0;
 
-// BREATH/FLICKER
-static BreathMsg  currentBreath = { MODE_NONE };
-static volatile bool effect_active = false;
-static uint32_t    effect_end_ms = 0;
-static uint32_t    last_seq = 0;
+static BreathMsg  last_breath{};
+static bool       have_last_breath = false;
 
-static BreathMsg   pendingBreath{};
-static volatile bool has_pending = false;
+static FlickerMsg last_flicker{};
+static bool       have_last_flicker = false;
+static uint32_t   last_flicker_retx_ms = 0;
 
-static FlickerMsg  currentFlicker{};
-static volatile bool flicker_active = false;
-static uint32_t    last_flicker_seq = 0;
-
-static FlickerMsg  pendingFlicker{};
-static volatile bool has_pending_flicker = false;
-
-// TEST
-static TestMsg     currentTest{};
-static volatile bool test_active = false;
-static uint32_t    last_test_seq = 0;
-static uint16_t    test_idx = 0;
-static uint32_t    test_next_ms = 0;
-
-// -------------------- Callbacks from comms::espnow -------
-static void on_breath_cb(const uint8_t from[6], const BreathMsg& msg){
-  if (effect_active && !(msg.flags & F_INTERRUPT)) return;
-  if (msg.seq <= last_seq) return;
-  last_seq = msg.seq;
-
-  taskENTER_CRITICAL(&breathMux);
-  pendingBreath = msg;
-  has_pending   = true;
-  taskEXIT_CRITICAL(&breathMux);
+static void addPeer(const uint8_t mac[6]) {
+  esp_now_peer_info_t p{};
+  memcpy(p.peer_addr, mac, 6);
+  p.channel = 0;
+  p.encrypt = false;
+  esp_now_add_peer(&p);
+}
+static void onDataSent(const uint8_t*, esp_now_send_status_t s) {
+  Serial.println(s == ESP_NOW_SEND_SUCCESS ? "ESP-NOW send ok" : "ESP-NOW send FAIL");
+}
+static void setupESPNow() {
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init error");
+    return;
+  }
+  esp_now_register_send_cb(onDataSent);
+  if (NUM_SLAVES > 0) addPeer(PEERS[0]);   // only need first; slaves forward down-chain
+}
+static inline void send_to_first_slave(const void* data, size_t len) {
+  if (NUM_SLAVES == 0) return;
+  esp_err_t err = esp_now_send(PEERS[0], (const uint8_t*)data, len);
+  if (err != ESP_OK) Serial.printf("esp_now_send err=%d\n", err);
 }
 
-static void on_flicker_cb(const uint8_t from[6], const FlickerMsg& msg){
-  if (flicker_active && !(msg.flags & F_INTERRUPT)) return;
-  if (msg.seq <= last_flicker_seq) return;
-  last_flicker_seq = msg.seq;
+// -------------------- Chain commands (master) --------------------
+static void startBreathAll(uint8_t r,uint8_t g,uint8_t b,
+                           float bmin,float bmax,
+                           uint32_t up_ms,uint32_t down_ms,
+                           uint16_t cycles,
+                           bool interrupt=false,
+                           uint8_t ttl=40,
+                           uint32_t start_offset=500)
+{
+  BreathMsg m{};
+  m.mode  = MODE_BREATH;
+  m.r = r; m.g = g; m.b = b;
+  m.b_min = bmin < 0 ? 0 : (bmin > 1 ? 1 : bmin);
+  m.b_max = bmax < 0 ? 0 : (bmax > 1 ? 1 : bmax);
+  if (m.b_max < m.b_min) { float t = m.b_min; m.b_min = m.b_max; m.b_max = t; }
+  m.up_ms   = up_ms   ? up_ms   : 1;
+  m.down_ms = down_ms ? down_ms : 1;
+  m.cycles  = cycles;
+  m.seq     = g_seq++;
+  m.flags   = interrupt ? F_INTERRUPT : 0;
+  m.ttl     = ttl;
+  m.t0_ms   = millis() + start_offset;
 
-  taskENTER_CRITICAL(&breathMux);
-  pendingFlicker       = msg;
-  has_pending_flicker  = true;
-  taskEXIT_CRITICAL(&breathMux);
+  send_to_first_slave(&m, sizeof(m));
+  last_breath = m;
+  have_last_breath = true;
+  Serial.println("BREATH: command sent");
 }
 
-static void on_test_cb(const uint8_t from[6], const TestMsg& msg){
-  // Preempt other effects unless told otherwise
-  if (test_active && !(msg.flags & F_INTERRUPT)) return;
-  if (msg.seq <= last_test_seq) return;
-  last_test_seq = msg.seq;
+static void startFlickerAll(uint32_t on_ms,
+                            uint32_t off_ms,
+                            uint16_t cycles,
+                            bool invert=false,
+                            bool interrupt=false,
+                            uint8_t ttl=40,
+                            uint32_t start_offset=300)
+{
+  FlickerMsg f{};
+  f.mode   = MODE_FLICKER;
+  f.on_ms  = on_ms  ? on_ms  : 1;
+  f.off_ms = off_ms ? off_ms : 1;
+  f.cycles = cycles;
+  f.invert = invert ? 1 : 0;
+  f.seq    = g_seq++;
+  f.flags  = interrupt ? F_INTERRUPT : 0;
+  f.ttl    = ttl;
+  f.t0_ms  = millis() + start_offset;
 
-  currentTest  = msg;
-  test_idx     = 0;
-  test_next_ms = msg.t0_ms;  // already rebased by comms layer
-  test_active  = true;
-
-  // Turn off other effects while testing
-  effect_active  = false;
-  flicker_active = false;
-
-  Serial.printf("TEST start: seq=%lu step=%u ms color=(%u,%u,%u) ttl=%u\n",
-                (unsigned long)msg.seq, (unsigned)msg.step_ms,
-                msg.r, msg.g, msg.b, msg.ttl);
+  send_to_first_slave(&f, sizeof(f));
+  last_flicker = f;
+  have_last_flicker = true;
+  Serial.println("FLICKER: command sent");
 }
 
-// -------------------- Setup/Loop -------------------------
+static void startTestChain(uint16_t step_ms,
+                           uint8_t r, uint8_t g, uint8_t b,
+                           uint8_t ttl = 60,
+                           uint32_t start_offset = 500)
+{
+  TestMsg t{};
+  t.mode    = MODE_TEST;
+  t.seq     = g_seq++;
+  t.flags   = F_INTERRUPT;     // test preempts other effects
+  t.ttl     = ttl;
+  t.t0_ms   = millis() + start_offset;
+  t.step_ms = step_ms;
+  t.r = r; t.g = g; t.b = b;
+  send_to_first_slave(&t, sizeof(t));
+  Serial.println("TEST chain kicked off.");
+}
+
+// -------------------- BLDC bring-up helpers (manual sweep) --------------------
+static const int8_t HIN_TAB[6][3] = {
+  {1,0,0},{1,0,0},{0,1,0},{0,1,0},{0,0,1},{0,0,1}
+};
+static const int8_t LIN_TAB[6][3] = {
+  {0,1,0},{0,0,1},{0,0,1},{1,0,0},{1,0,0},{0,1,0}
+};
+
+static inline void setHIN(uint8_t phase, bool on) {
+  uint8_t pin = (phase==0)?HIN1:(phase==1)?HIN2:HIN3;
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, on ? HIGH : LOW);
+}
+static inline void setLIN(uint8_t phase, bool on) {
+  uint8_t pin = (phase==0)?LIN1:(phase==1)?LIN2:LIN3;
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, on ? HIGH : LOW);
+}
+static void alignHold(int step = 0, int ms = 600) {
+  pinMode(ENABLE, OUTPUT);
+  digitalWrite(ENABLE, HIGH);
+  for (int i=0;i<3;i++) {
+    setHIN(i, HIN_TAB[step][i]);
+    setLIN(i, LIN_TAB[step][i]);
+  }
+  delay(ms);
+}
+static void commutateSweep(int delay_ms, int cycles) {
+  int step = 0;
+  for (int c=0; c<cycles; ++c) {
+    for (int k=0; k<6; ++k) {
+      for (int i=0;i<3;i++) { setHIN(i, HIN_TAB[step][i]); setLIN(i, LIN_TAB[step][i]); }
+      delay(delay_ms);
+      step = (step+1) % 6;
+    }
+  }
+}
+static void motorBringUpOnce() {
+  pinMode(HIN1, OUTPUT); pinMode(HIN2, OUTPUT); pinMode(HIN3, OUTPUT);
+  pinMode(LIN1, OUTPUT); pinMode(LIN2, OUTPUT); pinMode(LIN3, OUTPUT);
+  pinMode(ENABLE, OUTPUT); digitalWrite(ENABLE, HIGH);
+  alignHold(0, 800);
+  commutateSweep(/*delay_ms*/ 30, /*cycles*/ 20);
+  for (int i=0;i<3;i++){ setHIN(i,false); setLIN(i,false); }
+}
+
+// -------------------- Local DotStar helper --------------------
+static void fillStrip(uint8_t r,uint8_t g,uint8_t b){
+  for (int i=0;i<MASTER_NUM_LEDS;i++) strip.setPixelColor(i, r,g,b);
+  strip.show();
+}
+
+// -------------------- Center (push-pull) dither for actuator --------------------
+struct CenterCfg {
+  int      power        = 90;    // base duty (0..255)
+  uint16_t pulse_ms     = 25;    // ON duration per pulse
+  uint16_t gap_ms       = 30;    // coast/brake gap between pulses
+  int8_t   bias         = 0;     // + pushes forward, - pushes reverse
+  bool     useBrake     = false; // true: brake in gaps, false: coast
+  uint8_t  brakeDuty    = 200;   // brake strength if useBrake=true
+};
+static CenterCfg g_center;
+static bool      g_center_on = false;
+enum class CenterState { Idle, PulseFwd, Gap1, PulseRev, Gap2 };
+static CenterState g_cstate = CenterState::Idle;
+static uint32_t    g_ctmr   = 0;
+
+static void center_off(){ g_center_on=false; g_cstate=CenterState::Idle; actuator::coast(); }
+static void center_on(){  g_center_on=true;  g_cstate=CenterState::Idle; }
+static void center_tick(){
+  if (!g_center_on) return;
+  uint32_t now = millis();
+  auto doBrakeOrCoast = [&](){ if (g_center.useBrake) actuator::brake(g_center.brakeDuty);
+                               else                   actuator::coast(); };
+  switch (g_cstate){
+    case CenterState::Idle:
+      actuator::drive( constrain(g_center.power + max(0,(int)g_center.bias), 0, 255) );
+      g_ctmr = now; g_cstate = CenterState::PulseFwd; break;
+    case CenterState::PulseFwd:
+      if (now - g_ctmr >= g_center.pulse_ms){ doBrakeOrCoast(); g_ctmr=now; g_cstate=CenterState::Gap1; }
+      break;
+    case CenterState::Gap1:
+      if (now - g_ctmr >= g_center.gap_ms){
+        actuator::drive( -constrain(g_center.power + max(0, -(int)g_center.bias), 0, 255) );
+        g_ctmr=now; g_cstate=CenterState::PulseRev;
+      }
+      break;
+    case CenterState::PulseRev:
+      if (now - g_ctmr >= g_center.pulse_ms){ doBrakeOrCoast(); g_ctmr=now; g_cstate=CenterState::Gap2; }
+      break;
+    case CenterState::Gap2:
+      if (now - g_ctmr >= g_center.gap_ms){
+        actuator::drive( constrain(g_center.power + max(0,(int)g_center.bias), 0, 255) );
+        g_ctmr=now; g_cstate=CenterState::PulseFwd;
+      }
+      break;
+  }
+}
+
+// -------------------- Console parsing (line-based only) --------------------
+static String g_line;
+
+static void printHelp(){
+  Serial.println(F(
+    "\nActuator console (type then Enter):\n"
+    "  f N          -> forward with duty N (0..255)\n"
+    "  r N          -> reverse with duty N (0..255)\n"
+    "  c            -> coast\n"
+    "  b [N]        -> brake, optional duty N (default 255)\n"
+    "  burst P T    -> burst with signed power P (-255..255) for T ms\n"
+    "  auto on/off  -> enable/disable auto state machine\n"
+    "  auto duty N  -> set runDuty for AUTO\n"
+    "  auto set f a b | r a b | k a b | s a b   (ms ranges)\n"
+    "  brake duty N -> set brakeDuty for AUTO\n"
+    "  center on|off | power N | pulse ms | gap ms | bias B | brake on|off|N | status\n"
+    "  status       -> print status\n"
+    "\nLED / chain (also line-based):\n"
+    "  led r | led g | led b\n"
+    "  led f on off [cycles]\n"
+    "  led c\n"
+    "  led t [step_ms] [r g b]\n"
+    "  mbringup      (manual BLDC 6-step sweep)\n"
+    "  help or ?\n"
+    " routine on|off|pause|resume|status\n"
+    " routine log on|off\n"
+    " routine dur idle|settle|fwd|coast|brake|rev <min_ms> <max_ms>\n"
+    " routine duty N\n"
+    " routine brake N\n"
+
+  ));
+}
+
+static bool parseRoutineState(const String& s, routine::State& out){
+  if      (s == "idle")   { out = routine::State::Idle;      return true; }
+  else if (s == "settle") { out = routine::State::FwdSettle; return true; }
+  else if (s == "fwd")    { out = routine::State::FwdCenter; return true; }
+  else if (s == "coast")  { out = routine::State::Coast;     return true; }
+  else if (s == "brake")  { out = routine::State::Brake;     return true; }
+  else if (s == "rev")    { out = routine::State::Reverse;   return true; }
+  return false;
+}
+
+static void splitTokens(const String& s, String out[], int& n, int maxN){
+  n = 0; int i=0;
+  while (i < (int)s.length()){
+    while (i<(int)s.length() && isspace((unsigned char)s[i])) i++;
+    if (i >= (int)s.length()) break;
+    int j=i;
+    while (j<(int)s.length() && !isspace((unsigned char)s[j])) j++;
+    if (n < maxN) out[n++] = s.substring(i,j);
+    i = j;
+  }
+}
+static long toLong(const String& s, long def=0){ char* e=nullptr; long v=strtol(s.c_str(), &e, 10); return (e && *e==0) ? v : def; }
+
+static void handleCommand(const String& line){
+  String t[10]; int n=0; splitTokens(line, t, n, 10);
+  if (n==0) return;
+
+  if (t[0] == "?" || t[0] == "help"){ printHelp(); return; }
+
+  // ----- LED / chain -----
+  if (t[0] == "led") {
+    if (n < 2){ printHelp(); return; }
+    const String& sub = t[1];
+    if (sub=="r"){ startBreathAll(255,0,0, 0.05f,0.6f, 900,1100, 0, true);   Serial.println("BREATH: red");   return; }
+    if (sub=="g"){ startBreathAll(0,255,0, 0.05f,0.6f, 900,1100, 0, true);   Serial.println("BREATH: green"); return; }
+    if (sub=="b"){ startBreathAll(0,0,255, 0.05f,0.7f, 1000,1200, 0, true);  Serial.println("BREATH: blue");  return; }
+    if (sub=="c"){ startFlickerAll(1,0,1, false, true);                      Serial.println("FLICKER: cleared"); return; }
+    if (sub=="f"){
+      uint32_t on  = (n>=3)? (uint32_t)toLong(t[2],20) : 20;
+      uint32_t off = (n>=4)? (uint32_t)toLong(t[3],20) : 20;
+      uint16_t cyc = (n>=5)? (uint16_t)toLong(t[4],40) : 40;
+      startFlickerAll(on, off, cyc, false, true);
+      Serial.printf("FLICKER: %u/%u x%u\n", (unsigned)on,(unsigned)off,(unsigned)cyc);
+      return;
+    }
+    if (sub=="t"){
+      uint16_t step = (n>=3)? (uint16_t)toLong(t[2],50) : 50;
+      uint8_t  rr   = (n>=4)? (uint8_t)toLong(t[3],255):255;
+      uint8_t  gg   = (n>=5)? (uint8_t)toLong(t[4],0)  :0;
+      uint8_t  bb   = (n>=6)? (uint8_t)toLong(t[5],0)  :0;
+      startTestChain(step, rr, gg, bb, 60);
+      Serial.printf("TEST: step=%u color=(%u,%u,%u)\n", step, rr,gg,bb);
+      return;
+    }
+    if (sub=="mbringup"){ Serial.println("BLDC bring-up sweep…"); motorBringUpOnce(); return; }
+    printHelp(); return;
+  }
+
+  // ----- CENTER mode -----
+  if (t[0] == "center"){
+    if (n>=2 && t[1]=="on"){ actuator::enableAuto(false); center_on();
+      Serial.printf("CENTER on  power=%d pulse=%u gap=%u bias=%d brake=%s(%u)\n",
+        g_center.power,g_center.pulse_ms,g_center.gap_ms,g_center.bias,
+        g_center.useBrake?"on":"off", g_center.brakeDuty); return; }
+    if (n>=2 && t[1]=="off"){ center_off(); Serial.println("CENTER off"); return; }
+    if (n>=3 && t[1]=="power"){ g_center.power = constrain((int)toLong(t[2],g_center.power),0,255);
+      Serial.printf("CENTER power=%d\n", g_center.power); return; }
+    if (n>=3 && t[1]=="pulse"){ g_center.pulse_ms = (uint16_t)max(1L,toLong(t[2],g_center.pulse_ms));
+      Serial.printf("CENTER pulse=%u ms\n", g_center.pulse_ms); return; }
+    if (n>=3 && t[1]=="gap"){ g_center.gap_ms = (uint16_t)max(0L,toLong(t[2],g_center.gap_ms));
+      Serial.printf("CENTER gap=%u ms\n", g_center.gap_ms); return; }
+    if (n>=3 && t[1]=="bias"){ g_center.bias=(int8_t)constrain((int)toLong(t[2],g_center.bias),-127,127);
+      Serial.printf("CENTER bias=%d\n", g_center.bias); return; }
+    if (n>=3 && t[1]=="brake"){
+      if (t[2]=="on"){ g_center.useBrake=true;  Serial.println("CENTER brake=on");  return; }
+      if (t[2]=="off"){g_center.useBrake=false; Serial.println("CENTER brake=off"); return; }
+      g_center.brakeDuty=(uint8_t)constrain((int)toLong(t[2],g_center.brakeDuty),0,255);
+      Serial.printf("CENTER brake duty=%u\n", g_center.brakeDuty); return;
+    }
+    if (n>=2 && t[1]=="status"){
+      Serial.printf("CENTER %s power=%d pulse=%u gap=%u bias=%d brake=%s(%u)\n",
+        g_center_on?"ON":"OFF", g_center.power, g_center.pulse_ms, g_center.gap_ms,
+        g_center.bias, g_center.useBrake?"on":"off", g_center.brakeDuty); return;
+    }
+    Serial.println("center on|off | power N | pulse ms | gap ms | bias B | brake on|off|N | status");
+    return;
+  }
+
+  // ----- Actuator manual / auto -----
+  if (t[0] == "f" && n>=2){ center_off(); actuator::enableAuto(false);
+    int d = constrain((int)toLong(t[1],120), 0, 255); actuator::drive(d); Serial.printf("MANUAL forward %d\n", d); return; }
+  if (t[0] == "r" && n>=2){ center_off(); actuator::enableAuto(false);
+    int d = constrain((int)toLong(t[1],120), 0, 255); actuator::drive(-d); Serial.printf("MANUAL reverse %d\n", d); return; }
+  if (t[0] == "c"){ center_off(); actuator::enableAuto(false); actuator::coast(); Serial.println("COAST"); return; }
+  if (t[0] == "b"){ center_off(); actuator::enableAuto(false);
+    int d = (n>=2)? constrain((int)toLong(t[1],255),0,255):255; actuator::brake(d); Serial.printf("BRAKE duty=%d\n", d); return; }
+  if (t[0] == "burst" && n>=3){ center_off(); actuator::enableAuto(false);
+    int p = constrain((int)toLong(t[1],200), -255, 255); int ms = max(0,(int)toLong(t[2],100));
+    actuator::burst(p, (uint16_t)ms); Serial.printf("BURST power=%d ms=%d\n", p, ms); return; }
+
+  if (t[0] == "auto" && n>=2){
+    if (t[1]=="on"){ center_off(); actuator::enableAuto(true); Serial.println("AUTO on"); return; }
+    if (t[1]=="off"){ actuator::enableAuto(false); Serial.println("AUTO off"); return; }
+    if (t[1]=="duty" && n>=3){ auto cfg = actuator::getAutoConfig();
+      cfg.runDuty = constrain((int)toLong(t[2], cfg.runDuty), 0, 255);
+      actuator::setAutoConfig(cfg); Serial.printf("AUTO runDuty=%d\n", cfg.runDuty); return; }
+    if (t[1]=="set" && n>=5){
+      auto cfg = actuator::getAutoConfig();
+      uint16_t a = (uint16_t)max(0L, toLong(t[3],0));
+      uint16_t b = (uint16_t)max(0L, toLong(t[4],0));
+      if      (t[2]=="f"){ cfg.fwdMinMs=a;   cfg.fwdMaxMs=b; }
+      else if (t[2]=="r"){ cfg.revMinMs=a;   cfg.revMaxMs=b; }
+      else if (t[2]=="k"){ cfg.brakeMinMs=a; cfg.brakeMaxMs=b; }
+      else if (t[2]=="s"){ cfg.coastMinMs=a; cfg.coastMaxMs=b; }
+      actuator::setAutoConfig(cfg);
+      Serial.printf("AUTO set %s=(%u..%u)ms\n", t[2].c_str(), a,b); return;
+    }
+  }
+
+  if (t[0] == "brake" && n>=3 && t[1]=="duty"){
+    auto cfg = actuator::getAutoConfig();
+    cfg.brakeDuty = constrain((int)toLong(t[2], cfg.brakeDuty), 0, 255);
+    actuator::setAutoConfig(cfg); Serial.printf("AUTO brakeDuty=%d\n", cfg.brakeDuty); return;
+  }
+
+  if (t[0] == "mbringup"){ Serial.println("BLDC bring-up sweep…"); motorBringUpOnce(); return; }
+
+    if (t[0] == "routine") {
+    // on/off/pause/resume/status
+    if (n>=2 && t[1]=="on")     { routine::start();                 return; }
+    if (n>=2 && t[1]=="off")    { routine::stop();                  return; }
+    if (n>=2 && t[1]=="pause")  { routine::pause(true);             return; }
+    if (n>=2 && t[1]=="resume") { routine::pause(false);            return; }
+    if (n>=2 && t[1]=="status") { routine::status(Serial);          return; }
+
+    // log on|off
+    if (n>=3 && t[1]=="log") {
+      if (t[2]=="on")  { routine::set_log(true);  Serial.println("ROUTINE log=on");  return; }
+      if (t[2]=="off") { routine::set_log(false); Serial.println("ROUTINE log=off"); return; }
+    }
+
+    // dur <state> <min_ms> <max_ms>
+    if (n>=5 && t[1]=="dur") {
+      routine::State st;
+      if (!parseRoutineState(t[2], st)) {
+        Serial.println("States: idle|settle|fwd|coast|brake|rev");
+        return;
+      }
+      uint16_t min_ms = (uint16_t)max(0L, toLong(t[3], 0));
+      uint16_t max_ms = (uint16_t)max(0L, toLong(t[4], 0));
+      routine::set_duration(st, min_ms, max_ms);
+      Serial.printf("ROUTINE dur(%s)=%u..%u ms\n", t[2].c_str(), min_ms, max_ms);
+      return;
+    }
+
+    // duty N   (reverse power)
+    if (n>=3 && t[1]=="duty") {
+      int v = constrain((int)toLong(t[2], 70), 0, 255);
+      routine::set_run_duty(v);
+      Serial.printf("ROUTINE runDuty=%d\n", v);
+      return;
+    }
+
+    // brake N  (brake duty)
+    if (n>=3 && t[1]=="brake") {
+      uint8_t v = (uint8_t)constrain((int)toLong(t[2], 160), 0, 255);
+      routine::set_brake_duty(v);
+      Serial.printf("ROUTINE brakeDuty=%u\n", v);
+      return;
+    }
+
+    Serial.println(
+      "Usage:\n"
+      "  routine on|off|pause|resume|status\n"
+      "  routine log on|off\n"
+      "  routine dur idle|settle|fwd|coast|brake|rev <min_ms> <max_ms>\n"
+      "  routine duty N\n"
+      "  routine brake N"
+    );
+    return;
+  }
+
+  Serial.println("Unknown command. Type '?' for help.");
+}
+
+static void processSerial(){
+  while (Serial.available()){
+    char c = (char)Serial.read();
+    if (c == '\r') continue;           // ignore CR
+    if (c == '\n'){
+      String line = g_line; g_line = "";
+      if (line.length()) handleCommand(line);
+    } else {
+      g_line += c;
+      // optional: simple echo so you see what you're typing
+      // Serial.write(c);
+    }
+  }
+}
+
+//static void routine_flicker_cb(uint32_t on_ms, uint32_t off_ms, uint16_t cycles,
+//                               bool invert, bool interrupt)
+//{
+//  // match your working CLI behavior
+//  startFlickerAll(on_ms, off_ms, cycles, invert, interrupt, /*ttl*/40, /*start_offset*/80);
+//  Serial.println("Flicker sent");
+//}
+
+static void routine_flicker_cb(uint32_t on_ms, uint32_t off_ms, uint16_t cycles,
+                               bool invert, bool interrupt)
+{
+  // If CENTER mode is currently on, force LEDs to follow its exact pulse/gap.
+  // Otherwise, pass through what routine requested.
+  if (g_center_on) {
+    startFlickerAll(g_center.pulse_ms,
+                    g_center.gap_ms,
+                    /*cycles*/0,         // continuous while in CENTER
+                    /*invert*/false,
+                    /*interrupt*/true,
+                    /*ttl*/40,
+                    /*start_offset*/80);
+  } else {
+    startFlickerAll(on_ms, off_ms, cycles, invert, interrupt, /*ttl*/40, /*start_offset*/80);
+  }
+  Serial.println("Flicker sent");
+}
+static void on_routine_state_change(routine::State ns, routine::State){
+  switch (ns){
+    case routine::State::Idle:
+      startFlickerAll(1,0,1, false, true, 40, 80); // clear
+      startBreathAll(0,0,64, 0.02f,0.20f, 1000,1200, 0, true, 40, 80);
+      fillStrip(0,0,20);
+      break;
+
+    case routine::State::FwdSettle:
+      startFlickerAll(80, 140, /*cycles*/6, false, true, 40, 80);
+      fillStrip(60,60,60);
+      break;
+
+    case routine::State::FwdCenter:
+      // lock to CENTER cadence
+      startFlickerAll(g_center.pulse_ms, g_center.gap_ms, /*cycles*/0, false, true, 40, 80);
+      fillStrip(0,50,0);
+      break;
+
+    case routine::State::Coast:
+      startFlickerAll(1,0,1, false, true, 40, 80); // clear
+      startBreathAll(0,0,255, 0.05f,0.60f, 1200,1400, 0, true, 40, 80);
+      fillStrip(0,0,40);
+      break;
+
+    case routine::State::Brake:
+      startFlickerAll(60, 60, /*cycles*/0, false, true, 40, 80);
+      fillStrip(60,0,0);
+      break;
+
+    case routine::State::Reverse:
+      startFlickerAll(120, 100, /*cycles*/0, false, true, 40, 80);
+      fillStrip(40,25,0);
+      break;
+  }
+}
+
+
+// -------------------- Arduino setup/loop --------------------
 void setup() {
   Serial.begin(115200);
+  Serial.println(F(FW_TAG));
+  pinMode(LED_BUILTIN, OUTPUT);
 
-  Serial.begin(115200);
-  Serial.setRxBufferSize(1024);   // larger UART RX buffer
-  Serial.setTimeout(0);
+  // Local status LEDs
+  strip.begin();
+  strip.show();
 
-  // LEDs
-  leds::setup(NUM_LEDS, DATAPIN, CLOCKPIN, DOTSTAR_BRG);
-  leds::setBrightness(255);
-  leds::setGrouping(LED_SPACING, LED_ON_COUNT);
-  leds::setDefaultFlickerColor(DEFAULT_FLICKER_R, DEFAULT_FLICKER_G, DEFAULT_FLICKER_B);
-  leds::clear();
+    setupESPNow();
+  Serial.print("Master MAC: "); Serial.println(WiFi.macAddress());
 
-  // ESP-NOW
-  comms::espnow::init(PEERS, NUM_SLAVES, SLAVE_INDEX, on_breath_cb, on_flicker_cb, on_test_cb);
-  // comms::espnow::set_verbose(true); // if you exposed it
+  // --- MOTOR (BLDC) ---
+  motion::Config mcfg;
+  mcfg.min_delay_us   = 12 * 1000;
+  mcfg.max_delay_us   = 55 * 1000;
+  mcfg.ramp_k         = 0.65f;
+  mcfg.base_pwm_duty  = PWM_DEFAULT_DUTY;
+  mcfg.use_zero_cross = false;
+  motion::setup(mcfg);
+  motion::startOpenLoop();
 
-  Serial.print("SLAVE_INDEX: "); Serial.println(SLAVE_INDEX);
-  Serial.print("MAC Address: ");  Serial.println(WiFi.macAddress());
+  // --- ACTUATOR (DRV8833) ---
+  actuator::setup(AIN1, AIN2, AIN1_CH, AIN2_CH, /*freq*/40, /*res*/8);
+  actuator::AutoConfig acfg;
+  actuator::setAutoConfig(acfg);
+  actuator::enableAuto(true);
+
+  // Kick off a default breath so slaves show life
+  startBreathAll(0,0,255, 0.05f,0.6f, 1200,1400, 0, true);
+  fillStrip(0,0,40);
+  
+  routine::set_state_cb(on_routine_state_change);
+  routine::set_flicker_cb(routine_flicker_cb);   // <-- important
+  routine::set_log(false);
+  routine::start();                             // <-- start it
+
+  routine::set_flicker_cb(routine_flicker_cb);
+  Serial.printf("main: cb=%p\n", (void*)routine_flicker_cb);
+
+// sanity check: should print "Flicker sent" and "FLICKER: command sent"
+  routine_flicker_cb(100, 100, 3, false, true);
+  
+  printHelp();
 }
 
 void loop() {
   const uint32_t now = millis();
 
-  // Keep ESP-NOW link healthy (re-add peer if needed, etc.)
-  comms::espnow::tick();
 
-  // --- Commit pending BREATH ---
-  if (has_pending) {
-    taskENTER_CRITICAL(&breathMux);
-    currentBreath = pendingBreath;
-    has_pending   = false;
-    taskEXIT_CRITICAL(&breathMux);
+  processSerial();     // <-- ONLY line-based console
+  motion::tick();
+  actuator::tick();
+  center_tick();
+  routine::tick();
 
-    const uint32_t period = currentBreath.up_ms + currentBreath.down_ms;
-    const uint32_t total  = (!period || currentBreath.cycles == 0)
-                              ? 0xFFFFFFFFu
-                              : (uint32_t)currentBreath.cycles * period;
-    effect_end_ms = currentBreath.t0_ms + total;
-    effect_active = true;
+  // (Optional) rebroadcasts, uncomment if you want late joiner behavior:
+   if (have_last_breath && now - last_retx_ms > 2000) {
+     last_retx_ms = now;
+     BreathMsg reb = last_breath; reb.t0_ms = now + 200;
+     send_to_first_slave(&reb, sizeof(reb));
+   }
+   if (have_last_flicker && now - last_flicker_retx_ms > 1000) {
+     last_flicker_retx_ms = now;
+     FlickerMsg f = last_flicker; f.t0_ms = now + 80;
+     send_to_first_slave(&f, sizeof(f));
+   }
 
-    Serial.printf("New BREATH cmd: seq=%lu r=%u g=%u b=%u\n",
-                  (unsigned long)currentBreath.seq,
-                  currentBreath.r, currentBreath.g, currentBreath.b);
-  }
-
-  // --- Commit pending FLICKER ---
-  if (has_pending_flicker) {
-    taskENTER_CRITICAL(&breathMux);
-    currentFlicker       = pendingFlicker;
-    has_pending_flicker  = false;
-    taskEXIT_CRITICAL(&breathMux);
-
-    flicker_active = true;
-    Serial.printf("New FLICKER cmd: seq=%lu\n", (unsigned long)currentFlicker.seq);
-  }
-
-  // --- TEST state machine (non-blocking) ---
-  if (test_active && now >= test_next_ms) {
-    if (test_idx == 0) {
-      leds::clear(); // start with all off
-    }
-    if (test_idx < NUM_LEDS) {
-      leds::setPixel(test_idx, currentTest.r, currentTest.g, currentTest.b);
-      leds::show();                      // leave each LED on
-      test_idx++;
-      test_next_ms = now + currentTest.step_ms;
-    } else {
-      // Finished: keep LEDs as-is, then trigger next slave
-      test_active = false;
-      const size_t next = SLAVE_INDEX + 1;
-      if (next < NUM_SLAVES && currentTest.ttl > 0) {
-        TestMsg fwd = currentTest;
-        fwd.ttl  = currentTest.ttl - 1;
-        fwd.t0_ms = millis() + 100;     // small future start
-        // reuse same seq so duplicates are ignored naturally
-        comms::espnow::send_to_index(next, &fwd, sizeof(fwd));
-        Serial.printf("TEST forwarded to slave %u\n", (unsigned)next);
-      } else {
-        Serial.println("TEST finished (end of chain or TTL=0)");
-      }
-    }
-  }
-
-  // --- Render BREATH/FLICKER if not in TEST ---
-  if (!test_active) {
-    if (currentBreath.mode == MODE_NONE && !flicker_active) {
-      leds::clear();
-    } else {
-      leds::renderCombined(now, currentBreath, currentFlicker);
-    }
-  }
-
-  // --- Effect completion bookkeeping ---
-  if (flicker_active) {
-    const uint32_t period = (uint32_t)currentFlicker.on_ms + (uint32_t)currentFlicker.off_ms;
-    if (currentFlicker.cycles && period &&
-        (now - currentFlicker.t0_ms) >= (uint32_t)currentFlicker.cycles * period) {
-      flicker_active = false;
-      Serial.println("FLICKER finished");
-    }
-  }
-  if (effect_active && leds::breathFinished(now, currentBreath)) {
-    effect_active = false;
-    currentBreath.mode = MODE_NONE;
-    Serial.println("BREATH finished");
+  // small local status blink
+  static uint32_t led_ms = 0;
+  if (now - led_ms > 500) {
+    led_ms = now;
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
   }
 }
+

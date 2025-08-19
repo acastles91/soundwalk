@@ -5,7 +5,13 @@
 namespace routine {
 
 static FlickerFn s_flicker_cb = nullptr;
-void set_flicker_cb(FlickerFn fn){ s_flicker_cb = fn; }
+void set_flicker_cb(FlickerFn fn){ 
+  s_flicker_cb = fn; 
+  Serial.printf("routine: set_flicker_cb stored=%p\n", (void*)s_flicker_cb);
+}
+
+static StateCb s_state_cb = nullptr;
+void set_state_cb(StateCb cb){ s_state_cb = cb; }
 
 static bool     s_on   = false;
 static bool     s_paused = false;
@@ -27,13 +33,59 @@ static Spec s_spec[] = {
 /* Brake     */ { true,  true,  1,  40,  180 },
 /* Reverse   */ { true,  false, 2, 10,  100 },
 };
-
-static inline int idx(State s){ return (int)s; }
-
 static uint32_t randIn(uint16_t a, uint16_t b) {
   if (a > b) { uint16_t t=a; a=b; b=t; }
   return (uint32_t)random((long)a, (long)b+1);
 }
+static inline int idx(State s){ return (int)s; }
+static void enter(State s){
+  State old = s_state;          // remember old state
+
+  s_state = s;
+  s_t0    = millis();
+  s_dur   = randIn(s_spec[idx(s)].min_ms, s_spec[idx(s)].max_ms);
+
+  actuator::enableAuto(false);
+  center::off();
+
+  Serial.printf("routine: enter(%s) cb=%p\n", state_name(s), (void*)s_flicker_cb);
+
+  switch (s){
+    case State::Idle:
+    case State::FwdSettle:
+      actuator::coast();
+      if (s_flicker_cb) s_flicker_cb(1,0,1,false,true); // clear
+      break;
+
+    case State::FwdCenter:
+      center::on();
+      if (s_flicker_cb) s_flicker_cb(20, 20, 40, false, true); // 40 cycles (main can override timing)
+      break;
+
+    case State::Coast:
+      actuator::coast();
+      if (s_flicker_cb) s_flicker_cb(1,0,1,false,true); // clear
+      break;
+
+    case State::Brake:
+      actuator::brake(s_brakeDuty);
+      if (s_flicker_cb) s_flicker_cb(1,0,1,false,true); // clear
+      break;
+
+    case State::Reverse: {
+      int cmd = constrain(s_runDuty, 0, 255);
+      actuator::drive(-cmd);
+      if (s_flicker_cb) s_flicker_cb(20, 20, 40, false, true); // 40 cycles
+      break;
+    }
+  }
+
+  if (s_log) Serial.printf("ROUTINE -> %-9s dur=%lu ms\n", state_name(s), (unsigned long)s_dur);
+
+  // >>> fire state-change callback last
+  if (s_state_cb) s_state_cb(s, old);
+}
+
 
 const char* state_name(State s){
   switch (s){
@@ -65,44 +117,45 @@ static State pickRandomNext(State cur) {
   return cur;
 }
 
-static void enter(State s){
-  s_state = s;
-  s_t0    = millis();
-  s_dur   = randIn(s_spec[idx(s)].min_ms, s_spec[idx(s)].max_ms);
 
-  actuator::enableAuto(false);
-  center::off();
-
-  switch (s){
-    case State::Idle:
-    case State::FwdSettle:
-      actuator::coast();
-      if (s_flicker_cb) s_flicker_cb(1,0,1,false,true); // clear
-      break;
-    case State::FwdCenter:
-      center::on();
-      if (s_flicker_cb) s_flicker_cb(20, 20, 40, false, true); // 40 cycles
-      break;
-    case State::Coast:
-      actuator::coast();
-      if (s_flicker_cb) s_flicker_cb(1,0,1,false,true); // clear
-      break;
-    case State::Brake:
-      actuator::brake(s_brakeDuty);
-      if (s_flicker_cb) s_flicker_cb(1,0,1,false,true); // clear
-      break;
-    case State::Reverse: {
-      int cmd = constrain(s_runDuty, 0, 255);
-      actuator::drive(-cmd);
-      if (s_flicker_cb) s_flicker_cb(20, 20, 40, false, true); // 40 cycles
-      //if (s_log) Serial.printf("  Reverse duty=%d\n", cmd);
-      break;
-    }
-
-  }
-
-  if (s_log) Serial.printf("ROUTINE -> %-9s dur=%lu ms\n", state_name(s), (unsigned long)s_dur);
-}
+//static void enter(State s){
+//  s_state = s;
+//  s_t0    = millis();
+//  s_dur   = randIn(s_spec[idx(s)].min_ms, s_spec[idx(s)].max_ms);
+//
+//  actuator::enableAuto(false);
+//  center::off();
+//
+//  switch (s){
+//    case State::Idle:
+//    case State::FwdSettle:
+//      actuator::coast();
+//      if (s_flicker_cb) s_flicker_cb(1,0,1,false,true); // clear
+//      break;
+//    case State::FwdCenter:
+//      center::on();
+//      if (s_flicker_cb) s_flicker_cb(20, 20, 40, false, true); // 40 cycles
+//      break;
+//    case State::Coast:
+//      actuator::coast();
+//      if (s_flicker_cb) s_flicker_cb(1,0,1,false,true); // clear
+//      break;
+//    case State::Brake:
+//      actuator::brake(s_brakeDuty);
+//      if (s_flicker_cb) s_flicker_cb(1,0,1,false,true); // clear
+//      break;
+//    case State::Reverse: {
+//      int cmd = constrain(s_runDuty, 0, 255);
+//      actuator::drive(-cmd);
+//      if (s_flicker_cb) s_flicker_cb(20, 20, 40, false, true); // 40 cycles
+//      //if (s_log) Serial.printf("  Reverse duty=%d\n", cmd);
+//      break;
+//    }
+//
+//  }
+//
+//  if (s_log) Serial.printf("ROUTINE -> %-9s dur=%lu ms\n", state_name(s), (unsigned long)s_dur);
+//}
 
 void init(){ s_on=false; s_paused=false; s_state=State::Idle; s_t0=0; s_dur=0; }
 
@@ -117,7 +170,7 @@ void stop(){
   s_on = false; s_paused = false;
   center::off();
   actuator::coast();
-  s_state = State::Idle;
+  enter(State::Idle);
 }
 
 void pause(bool p){
